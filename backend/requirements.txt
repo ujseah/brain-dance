@@ -1,0 +1,34 @@
+# Brain Dance Backend Dependencies
+
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Data validation
+pydantic>=2.5.0
+
+# Async support
+aiofiles>=23.2.0
+
+# HTTP client (for API-based adapters)
+httpx>=0.26.0
+
+# VerseCrafter dependencies (install on GPU server only)
+# These are heavy and require CUDA - uncomment when on GPU server:
+# torch==2.3.0
+# torchvision
+# torchaudio
+# transformers==4.57.0
+# diffusers>=0.30.1
+# accelerate>=1.10.1
+# pytorch3d
+# flash-attn
+
+# Image processing
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Development
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
