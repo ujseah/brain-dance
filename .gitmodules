@@ -1,0 +1,3 @@
+[submodule "versecrafter"]
+	path = versecrafter
+	url = https://github.com/TencentARC/VerseCrafter.git
