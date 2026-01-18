@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Optional, Callable
 
+import numpy as np
+
 from .base import (
     WorldModelAdapter,
     PreprocessResult,
@@ -307,3 +309,84 @@ class VerseCrafterAdapter(WorldModelAdapter):
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+
+# =============================================================================
+# Coordinate System Utilities
+# =============================================================================
+#
+# VerseCrafter uses Blender's coordinate system internally (Z-up, Y-forward)
+# but depth maps and images use OpenCV convention (Y-down, Z-forward).
+#
+# OpenCV:  X = right, Y = down,  Z = forward (into screen)
+# Blender: X = right, Y = forward, Z = up
+#
+
+# Transformation matrix: OpenCV → Blender
+# Multiplying a point in OpenCV coords by this matrix gives Blender coords
+COORD_TRANSFORM_CV2BLENDER = np.array([
+    [1,  0,  0],   # Blender X = OpenCV X (right)
+    [0,  0,  1],   # Blender Y = OpenCV Z (forward)
+    [0, -1,  0],   # Blender Z = -OpenCV Y (up, since OpenCV Y points down)
+], dtype=np.float32)
+
+# Inverse transformation: Blender → OpenCV
+COORD_TRANSFORM_BLENDER2CV = np.array([
+    [1,  0,  0],   # OpenCV X = Blender X (right)
+    [0,  0, -1],   # OpenCV Y = -Blender Z (down)
+    [0,  1,  0],   # OpenCV Z = Blender Y (forward)
+], dtype=np.float32)
+
+
+def opencv_to_blender(points: np.ndarray) -> np.ndarray:
+    """
+    Convert 3D points from OpenCV to Blender coordinate system.
+
+    Args:
+        points: Array of shape (N, 3) or (3,) in OpenCV coordinates.
+
+    Returns:
+        Array of same shape in Blender coordinates.
+    """
+    return points @ COORD_TRANSFORM_CV2BLENDER.T
+
+
+def blender_to_opencv(points: np.ndarray) -> np.ndarray:
+    """
+    Convert 3D points from Blender to OpenCV coordinate system.
+
+    Args:
+        points: Array of shape (N, 3) or (3,) in Blender coordinates.
+
+    Returns:
+        Array of same shape in OpenCV coordinates.
+    """
+    return points @ COORD_TRANSFORM_BLENDER2CV.T
+
+
+def transform_camera_matrix_cv2blender(extrinsic: np.ndarray) -> np.ndarray:
+    """
+    Convert a 4x4 camera extrinsic matrix from OpenCV to Blender convention.
+
+    Args:
+        extrinsic: 4x4 world-to-camera matrix in OpenCV convention.
+
+    Returns:
+        4x4 camera-to-world matrix in Blender convention.
+    """
+    # Extract rotation and translation
+    R = extrinsic[:3, :3]
+    t = extrinsic[:3, 3]
+
+    # Convert rotation
+    R_blender = COORD_TRANSFORM_CV2BLENDER @ R @ COORD_TRANSFORM_BLENDER2CV
+
+    # Convert translation
+    t_blender = COORD_TRANSFORM_CV2BLENDER @ t
+
+    # Build camera-to-world (Blender convention)
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, :3] = R_blender.T  # Transpose for c2w
+    c2w[:3, 3] = -R_blender.T @ t_blender
+
+    return c2w
