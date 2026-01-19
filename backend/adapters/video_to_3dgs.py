@@ -26,7 +26,7 @@ class SegmentationOptions:
     """Options for object segmentation (Stage 1.5)."""
 
     enabled: bool = True
-    """Whether to run object segmentation. Critical for accurate hole-filling."""
+    """Whether to run object segmentation. Critical for accurate scene completion."""
 
     keyframe_interval: int = 10
     """Run SAM-2 automatic mask generation every Nth frame."""
@@ -50,17 +50,17 @@ class TrainingOptions:
 
 
 @dataclass
-class HoleFillingOptions:
-    """Options for AI hole-filling."""
+class SceneCompletionOptions:
+    """Options for AI scene completion (Stage 3)."""
 
     enabled: bool = True
-    """Whether to run hole-filling."""
+    """Whether to run scene completion. This is the core feature of Brain Dance."""
 
     quality: str = "balanced"
     """Quality preset: 'fast', 'balanced', 'high'."""
 
     num_views: int = 8
-    """Number of views to render around each hole."""
+    """Number of views to render around each detected gap."""
 
 
 @dataclass
@@ -90,8 +90,8 @@ class VideoTo3DGSResult:
     num_gaussians: int = 0
     """Number of Gaussians in final model."""
 
-    holes_filled: int = 0
-    """Number of holes filled by AI."""
+    regions_completed: int = 0
+    """Number of regions completed by AI scene completion."""
 
     metrics: dict = field(default_factory=dict)
     """Quality metrics and timing info."""
@@ -102,13 +102,13 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
     Adapter for video-to-3DGS reconstruction pipeline.
 
     This adapter transforms video footage into an explorable 3D Gaussian Splat
-    viewable in web browsers, with optional AI-powered hole filling.
+    viewable in web browsers, with AI-powered scene completion.
 
     Pipeline stages:
     1. Video Processing - Frame extraction + camera pose estimation
-    1.5. Object Segmentation - SAM-2 segmentation & tracking (critical for hole-filling)
+    1.5. Object Segmentation - SAM-2 segmentation & tracking (critical for scene completion)
     2. 3DGS Training - Train Splatfacto model from frames
-    3. Hole Filling (optional) - AI fills unseen regions using object masks
+    3. AI Scene Completion - Generate unseen regions using object-aware inpainting
     4. Web Export - Convert to compressed web format
 
     Requirements:
@@ -138,7 +138,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         self._video_stage = None
         self._segmentation_stage = None
         self._training_stage = None
-        self._hole_filling_stage = None
+        self._scene_completion_stage = None
         self._export_stage = None
 
     @property
@@ -147,7 +147,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
     @property
     def description(self) -> str:
-        return "Transform video into explorable 3D Gaussian Splat with AI hole-filling"
+        return "Transform video into explorable 3D Gaussian Splat with AI scene completion"
 
     def get_capabilities(self) -> ModelCapabilities:
         return ModelCapabilities(
@@ -202,8 +202,8 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         """
         Stage 1.5: Segment and track objects across frames.
 
-        This stage is CRITICAL for accurate hole-filling. Without object-aware
-        segmentation, holes get filled with "texture soup" - averaged nearby
+        This stage is CRITICAL for accurate scene completion. Without object-aware
+        segmentation, gaps get filled with "texture soup" - averaged nearby
         colors that don't respect object boundaries.
 
         Args:
@@ -269,52 +269,52 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
         return self._training_stage.train(processed, output_dir, progress_callback)
 
-    def fill_holes(
+    def complete_scene(
         self,
         ply_path: str,
         output_dir: str,
         masks_dir: Optional[str] = None,
-        options: Optional[HoleFillingOptions] = None,
+        options: Optional[SceneCompletionOptions] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         """
-        Stage 3: Fill holes in 3DGS using AI inpainting.
+        Stage 3: AI Scene Completion - Generate unseen regions.
 
-        Uses object masks from Stage 1.5 for object-aware hole filling.
-        Without masks, holes may be filled with "texture soup" that doesn't
-        respect object boundaries.
+        This is the core differentiator of Brain Dance. Uses object masks from
+        Stage 1.5 for object-aware completion, ensuring AI-generated regions
+        respect object boundaries and scene context.
 
         Args:
             ply_path: Path to trained PLY file.
             output_dir: Directory to store outputs.
             masks_dir: Path to masks from object segmentation (from Stage 1.5).
-            options: Hole-filling options.
+            options: Scene completion options.
             progress_callback: Optional callback(progress, message).
 
         Returns:
-            HoleFillingResult with path to refined PLY.
+            SceneCompletionResult with path to completed PLY.
         """
-        from ..stages.hole_filling import HoleFillingStage
+        from ..stages.scene_completion import SceneCompletionStage
         from ..stages.gaussian_training import GaussianTrainingResult
 
-        options = options or HoleFillingOptions()
+        options = options or SceneCompletionOptions()
 
         if not options.enabled:
             return None
 
-        if self._hole_filling_stage is None:
-            self._hole_filling_stage = HoleFillingStage({
+        if self._scene_completion_stage is None:
+            self._scene_completion_stage = SceneCompletionStage({
                 "quality": options.quality,
                 "num_inpaint_views": options.num_views,
-                "masks_dir": masks_dir,  # Pass object masks for object-aware filling
+                "masks_dir": masks_dir,  # Pass object masks for object-aware completion
             })
 
         trained = GaussianTrainingResult(
             ply_path=ply_path,
-            num_gaussians=0,  # Will be determined during filling
+            num_gaussians=0,  # Will be determined during completion
         )
 
-        return self._hole_filling_stage.fill(trained, output_dir, progress_callback)
+        return self._scene_completion_stage.complete(trained, output_dir, progress_callback)
 
     def export_for_web(
         self,
@@ -356,7 +356,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         video_options: Optional[VideoProcessingOptions] = None,
         segmentation_options: Optional[SegmentationOptions] = None,
         training_options: Optional[TrainingOptions] = None,
-        hole_filling_options: Optional[HoleFillingOptions] = None,
+        scene_completion_options: Optional[SceneCompletionOptions] = None,
         export_options: Optional[ExportOptions] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> VideoTo3DGSResult:
@@ -369,7 +369,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             video_options: Options for video processing stage.
             segmentation_options: Options for object segmentation stage (1.5).
             training_options: Options for training stage.
-            hole_filling_options: Options for hole-filling stage.
+            scene_completion_options: Options for AI scene completion stage.
             export_options: Options for export stage.
             progress_callback: Optional callback(progress, message).
 
@@ -385,7 +385,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         output_path.mkdir(parents=True, exist_ok=True)
 
         segmentation_options = segmentation_options or SegmentationOptions()
-        hole_filling_options = hole_filling_options or HoleFillingOptions()
+        scene_completion_options = scene_completion_options or SceneCompletionOptions()
 
         # Stage 1: Video Processing (0-20%)
         report(0.0, "Stage 1: Processing video")
@@ -419,22 +419,22 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             lambda p, m: report(0.35 + p * 0.35, f"[Training] {m}"),
         )
 
-        # Stage 3: Hole Filling (70-90%)
+        # Stage 3: AI Scene Completion (70-90%)
         final_ply = trained.ply_path
-        holes_filled = 0
+        regions_completed = 0
 
-        if hole_filling_options.enabled:
-            report(0.70, "Stage 3: Filling holes")
-            filled = self.fill_holes(
+        if scene_completion_options.enabled:
+            report(0.70, "Stage 3: Completing scene")
+            completed = self.complete_scene(
                 trained.ply_path,
-                str(output_path / "filled"),
-                masks_dir,  # Pass object masks for object-aware filling
-                hole_filling_options,
-                lambda p, m: report(0.70 + p * 0.20, f"[Hole-filling] {m}"),
+                str(output_path / "completed"),
+                masks_dir,  # Pass object masks for object-aware completion
+                scene_completion_options,
+                lambda p, m: report(0.70 + p * 0.20, f"[Scene Completion] {m}"),
             )
-            if filled:
-                final_ply = filled.ply_path
-                holes_filled = filled.num_holes_filled
+            if completed:
+                final_ply = completed.ply_path
+                regions_completed = completed.num_regions_completed
 
         # Stage 4: Web Export (90-100%)
         report(0.90, "Stage 4: Exporting for web")
@@ -453,7 +453,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             viewer_path=exported.viewer_path,
             num_frames=processed.num_frames,
             num_gaussians=trained.num_gaussians,
-            holes_filled=holes_filled,
+            regions_completed=regions_completed,
             metrics={
                 "training_metrics": trained.metrics,
                 "export_format": exported.format,
@@ -481,11 +481,11 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
     def cleanup(self) -> None:
         """Clean up resources."""
-        if self._hole_filling_stage:
-            self._hole_filling_stage.cleanup()
+        if self._scene_completion_stage:
+            self._scene_completion_stage.cleanup()
 
         self._video_stage = None
         self._segmentation_stage = None
         self._training_stage = None
-        self._hole_filling_stage = None
+        self._scene_completion_stage = None
         self._export_stage = None
