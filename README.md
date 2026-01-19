@@ -1,29 +1,29 @@
 # Brain Dance
 
-Generate controllable videos from static images with precise camera and object motion control.
+Transform video footage into explorable 3D worlds.
 
 ## Overview
 
-Brain Dance is an interactive world model editor for research and creative exploration. It lets you transform a single image into a dynamic video with explicit control over how the camera moves and how objects in the scene behave.
-
-Most video generation tools treat output as a black box—you describe what you want, and the model decides how it happens. Brain Dance takes a different approach: you define the geometry. Specify camera trajectories, object motion paths, and keyframes, then let the world model bring it to life with physical plausibility.
+Brain Dance reconstructs 3D scenes from video input, creating Gaussian Splat representations you can explore in your browser. Point your camera at a space, walk through it, and Brain Dance builds a 3D world you can navigate freely — with AI filling in the parts you never saw.
 
 ## Features
 
-- **Image-to-video generation** — Start from a single static image
-- **4D geometric control** — Precise camera motion and multi-object trajectories
-- **Trajectory editing** — Define keyframes with position, rotation, and interpolation
-- **Extensible architecture** — Plug in different world model backends
+- **Video to 3D** — Convert video footage into explorable 3D Gaussian Splats
+- **AI hole-filling** — Automatically fill unseen regions with plausible geometry
+- **Web viewer** — Explore reconstructed scenes in any browser
+- **Compressed export** — SPZ format for fast web streaming
 
 ## How It Works
 
-```
-Image → Preprocess → Edit Trajectories → Generate Video
-         (depth,       (camera path,
-        segments)      object motion)
+```text
+Video Input → Frame Extraction → Pose Estimation → 3DGS Training → AI Hole-Fill → Web Export
+              (ffmpeg)           (hloc/GLOMAP)     (Splatfacto)     (MVDream)      (SPZ)
 ```
 
-Brain Dance preprocesses your image to extract depth and segment objects, then lets you design motion trajectories in 3D space. These trajectories are rendered as control maps that guide a video diffusion model to generate the final output.
+1. **Video Processing**: Extract frames and estimate camera poses
+2. **3DGS Training**: Train 3D Gaussian Splatting model from multi-view images
+3. **Hole Filling**: AI fills gaps where the camera never looked
+4. **Web Export**: Compress and bundle for browser viewing
 
 ## Quick Start
 
@@ -39,13 +39,41 @@ The API server runs at `http://localhost:8000`. Check `/health` and `/adapters` 
 ## Requirements
 
 - Python 3.10+
-- CUDA 12.1+ for GPU inference
+- CUDA 12.1+ for GPU inference (required for 3DGS training)
+- 24GB+ VRAM recommended (RTX 3090/4090 or A100)
+
+## Project Structure
+
+```text
+brain-dance/
+├── backend/
+│   ├── adapters/           # Model adapters
+│   │   ├── video_to_3dgs.py   # Main pipeline adapter
+│   │   └── versecrafter.py    # Legacy (MoGe-V2 depth)
+│   ├── stages/             # Pipeline stages
+│   │   ├── video_processing.py
+│   │   ├── gaussian_training.py
+│   │   ├── hole_filling.py
+│   │   └── web_export.py
+│   └── server.py           # FastAPI server
+├── frontend/               # Next.js viewer (WIP)
+├── versecrafter/           # Submodule for MoGe-V2
+└── docs/                   # Documentation
+```
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md) — System design and pipeline details
+- [API](docs/API.md) — REST API specification
+- [Roadmap](docs/ROADMAP.md) — Implementation phases
 
 ## Acknowledgments
 
-- [VerseCrafter](https://github.com/TencentARC/VerseCrafter) by Tencent ARC
-- [Wan2.1](https://github.com/Wan-Video/Wan2.1) video diffusion model
+- [Nerfstudio](https://nerf.studio/) for Splatfacto implementation
+- [VerseCrafter](https://github.com/TencentARC/VerseCrafter) for MoGe-V2 depth estimation
+- [Spark.js](https://sparkjs.dev/) for web-based 3DGS rendering
+- [hloc](https://github.com/cvg/Hierarchical-Localization) for pose estimation
 
 ## License
 
-This project is for research and exploration. VerseCrafter (included as a submodule) has its own license restricting use to academic purposes.
+This project is for research and exploration. Dependencies have their own licenses.

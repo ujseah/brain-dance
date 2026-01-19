@@ -8,11 +8,15 @@ from .base import (
     DetectedObject,
     CameraInfo,
 )
+from .video_to_3dgs import VideoTo3DGSAdapter
+
+# Legacy adapter (kept for MoGe-V2 depth estimation in hole-filling)
 from .versecrafter import VerseCrafterAdapter
 
 # Registry of available adapters
 ADAPTERS = {
-    "versecrafter": VerseCrafterAdapter,
+    "video_to_3dgs": VideoTo3DGSAdapter,
+    "versecrafter": VerseCrafterAdapter,  # Legacy, kept for depth estimation
 }
 
 
@@ -21,7 +25,7 @@ def get_adapter(name: str, config: dict = None) -> WorldModelAdapter:
     Get an adapter instance by name.
 
     Args:
-        name: Adapter identifier (e.g., "versecrafter")
+        name: Adapter identifier (e.g., "video_to_3dgs", "versecrafter")
         config: Optional configuration dictionary
 
     Returns:
@@ -62,6 +66,7 @@ __all__ = [
     "ModelCapabilities",
     "DetectedObject",
     "CameraInfo",
+    "VideoTo3DGSAdapter",
     "VerseCrafterAdapter",
     "get_adapter",
     "list_adapters",

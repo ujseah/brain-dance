@@ -1,6 +1,8 @@
 # Brain Dance Backend Dependencies
 
-# Web framework
+# =============================================================================
+# Core Web Framework
+# =============================================================================
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.6
@@ -11,24 +13,57 @@ pydantic>=2.5.0
 # Async support
 aiofiles>=23.2.0
 
-# HTTP client (for API-based adapters)
+# HTTP client
 httpx>=0.26.0
 
-# VerseCrafter dependencies (install on GPU server only)
-# These are heavy and require CUDA - uncomment when on GPU server:
-# torch==2.3.0
-# torchvision
-# torchaudio
-# transformers==4.57.0
-# diffusers>=0.30.1
-# accelerate>=1.10.1
-# pytorch3d
-# flash-attn
-
-# Image processing
+# =============================================================================
+# Common Dependencies (all environments)
+# =============================================================================
 Pillow>=10.0.0
 numpy>=1.24.0
 
-# Development
+# =============================================================================
+# GPU Dependencies (install on GPU server only)
+# These require CUDA 12.1+ and significant VRAM
+# =============================================================================
+
+# --- Core ML ---
+# torch==2.3.0
+# torchvision
+# torchaudio
+
+# --- Video Processing & Pose Estimation ---
+# Uncomment for Stage 1: Video Processing
+# opencv-python>=4.8.0
+# ffmpeg-python>=0.2.0
+
+# --- Camera Pose Estimation ---
+# Uncomment for hloc pipeline
+# hloc @ git+https://github.com/cvg/Hierarchical-Localization.git
+# pycolmap>=0.6.0
+
+# --- 3DGS Training ---
+# Uncomment for Stage 2: 3DGS Training
+# nerfstudio>=1.0.0
+# gsplat>=0.1.0
+
+# --- AI Hole-Filling ---
+# Uncomment for Stage 3: Hole Filling
+# diffusers>=0.30.1
+# transformers>=4.40.0
+# accelerate>=1.0.0
+
+# --- VerseCrafter (for MoGe-V2 depth) ---
+# Uncomment for hole-filling depth estimation
+# pytorch3d
+# flash-attn
+
+# --- Web Export ---
+# Uncomment for Stage 4: Web Export
+# 3dgsconverter @ git+https://github.com/francescofugazzi/3dgsconverter.git
+
+# =============================================================================
+# Development & Testing
+# =============================================================================
 pytest>=7.4.0
 pytest-asyncio>=0.23.0

@@ -9,6 +9,7 @@ from typing import Optional, Callable
 class ModelCapabilities:
     """Describes what a world model adapter can do."""
 
+    # Video generation capabilities (legacy VerseCrafter-style)
     camera_control: bool = False
     """Can control camera trajectory (position, rotation, FOV)."""
 
@@ -21,14 +22,31 @@ class ModelCapabilities:
     segmentation: bool = False
     """Provides object segmentation."""
 
+    # 3DGS reconstruction capabilities (new video-to-3DGS pipeline)
+    supports_video_input: bool = False
+    """Can process video input for reconstruction."""
+
+    supports_3dgs_output: bool = False
+    """Outputs explorable 3D Gaussian Splat."""
+
+    supports_hole_filling: bool = False
+    """Supports AI-powered hole filling for unseen regions."""
+
+    supports_web_export: bool = False
+    """Can export to web-viewable formats (SPZ, KSPLAT)."""
+
+    # Limits
     max_duration: float = 10.0
-    """Maximum video duration in seconds."""
+    """Maximum video duration in seconds (for generation)."""
+
+    max_video_duration: float = 300.0
+    """Maximum input video duration for reconstruction (5 minutes)."""
 
     max_resolution: tuple = (1920, 1080)
     """Maximum output resolution (width, height)."""
 
     supported_formats: list = field(default_factory=lambda: ["mp4"])
-    """Supported output video formats."""
+    """Supported output formats."""
 
 
 @dataclass
