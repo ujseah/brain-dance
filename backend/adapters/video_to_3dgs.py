@@ -22,6 +22,23 @@ class VideoProcessingOptions:
 
 
 @dataclass
+class SegmentationOptions:
+    """Options for object segmentation (Stage 1.5)."""
+
+    enabled: bool = True
+    """Whether to run object segmentation. Critical for accurate hole-filling."""
+
+    keyframe_interval: int = 10
+    """Run SAM-2 automatic mask generation every Nth frame."""
+
+    min_object_size: int = 100
+    """Minimum object size in pixels to track."""
+
+    model_size: str = "large"
+    """SAM-2 model size: 'tiny', 'small', 'base', 'large'."""
+
+
+@dataclass
 class TrainingOptions:
     """Options for 3DGS training."""
 
@@ -89,8 +106,9 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
     Pipeline stages:
     1. Video Processing - Frame extraction + camera pose estimation
+    1.5. Object Segmentation - SAM-2 segmentation & tracking (critical for hole-filling)
     2. 3DGS Training - Train Splatfacto model from frames
-    3. Hole Filling (optional) - AI fills unseen regions
+    3. Hole Filling (optional) - AI fills unseen regions using object masks
     4. Web Export - Convert to compressed web format
 
     Requirements:
@@ -118,6 +136,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
         # Lazy-loaded stages
         self._video_stage = None
+        self._segmentation_stage = None
         self._training_stage = None
         self._hole_filling_stage = None
         self._export_stage = None
@@ -173,6 +192,45 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
         return self._video_stage.process(video_path, output_dir, progress_callback)
 
+    def segment_objects(
+        self,
+        frames_dir: str,
+        output_dir: str,
+        options: Optional[SegmentationOptions] = None,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+    ):
+        """
+        Stage 1.5: Segment and track objects across frames.
+
+        This stage is CRITICAL for accurate hole-filling. Without object-aware
+        segmentation, holes get filled with "texture soup" - averaged nearby
+        colors that don't respect object boundaries.
+
+        Args:
+            frames_dir: Directory containing extracted frames.
+            output_dir: Directory to store segmentation outputs.
+            options: Segmentation options.
+            progress_callback: Optional callback(progress, message).
+
+        Returns:
+            ObjectSegmentationResult with paths to masks and metadata.
+        """
+        from ..stages.object_segmentation import ObjectSegmentationStage
+
+        options = options or SegmentationOptions()
+
+        if not options.enabled:
+            return None
+
+        if self._segmentation_stage is None:
+            self._segmentation_stage = ObjectSegmentationStage({
+                "keyframe_interval": options.keyframe_interval,
+                "min_object_size": options.min_object_size,
+                "model_size": options.model_size,
+            })
+
+        return self._segmentation_stage.segment(frames_dir, output_dir, progress_callback)
+
     def train_3dgs(
         self,
         processed_dir: str,
@@ -215,15 +273,21 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         self,
         ply_path: str,
         output_dir: str,
+        masks_dir: Optional[str] = None,
         options: Optional[HoleFillingOptions] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         """
         Stage 3: Fill holes in 3DGS using AI inpainting.
 
+        Uses object masks from Stage 1.5 for object-aware hole filling.
+        Without masks, holes may be filled with "texture soup" that doesn't
+        respect object boundaries.
+
         Args:
             ply_path: Path to trained PLY file.
             output_dir: Directory to store outputs.
+            masks_dir: Path to masks from object segmentation (from Stage 1.5).
             options: Hole-filling options.
             progress_callback: Optional callback(progress, message).
 
@@ -242,6 +306,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             self._hole_filling_stage = HoleFillingStage({
                 "quality": options.quality,
                 "num_inpaint_views": options.num_views,
+                "masks_dir": masks_dir,  # Pass object masks for object-aware filling
             })
 
         trained = GaussianTrainingResult(
@@ -289,6 +354,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         video_path: str,
         output_dir: str,
         video_options: Optional[VideoProcessingOptions] = None,
+        segmentation_options: Optional[SegmentationOptions] = None,
         training_options: Optional[TrainingOptions] = None,
         hole_filling_options: Optional[HoleFillingOptions] = None,
         export_options: Optional[ExportOptions] = None,
@@ -301,6 +367,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             video_path: Path to input video file.
             output_dir: Base directory for all outputs.
             video_options: Options for video processing stage.
+            segmentation_options: Options for object segmentation stage (1.5).
             training_options: Options for training stage.
             hole_filling_options: Options for hole-filling stage.
             export_options: Options for export stage.
@@ -317,24 +384,39 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
+        segmentation_options = segmentation_options or SegmentationOptions()
         hole_filling_options = hole_filling_options or HoleFillingOptions()
 
-        # Stage 1: Video Processing (0-25%)
+        # Stage 1: Video Processing (0-20%)
         report(0.0, "Stage 1: Processing video")
         processed = self.process_video(
             video_path,
             str(output_path / "processed"),
             video_options,
-            lambda p, m: report(p * 0.25, f"[Video] {m}"),
+            lambda p, m: report(p * 0.20, f"[Video] {m}"),
         )
 
-        # Stage 2: 3DGS Training (25-70%)
-        report(0.25, "Stage 2: Training 3DGS")
+        # Stage 1.5: Object Segmentation (20-35%)
+        # Critical for accurate hole-filling - identifies object boundaries
+        masks_dir = None
+        if segmentation_options.enabled:
+            report(0.20, "Stage 1.5: Segmenting objects")
+            segmented = self.segment_objects(
+                processed.frames_dir,
+                str(output_path / "segmented"),
+                segmentation_options,
+                lambda p, m: report(0.20 + p * 0.15, f"[Segmentation] {m}"),
+            )
+            if segmented:
+                masks_dir = segmented.masks_dir
+
+        # Stage 2: 3DGS Training (35-70%)
+        report(0.35, "Stage 2: Training 3DGS")
         trained = self.train_3dgs(
             str(output_path / "processed"),
             str(output_path / "trained"),
             training_options,
-            lambda p, m: report(0.25 + p * 0.45, f"[Training] {m}"),
+            lambda p, m: report(0.35 + p * 0.35, f"[Training] {m}"),
         )
 
         # Stage 3: Hole Filling (70-90%)
@@ -346,6 +428,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             filled = self.fill_holes(
                 trained.ply_path,
                 str(output_path / "filled"),
+                masks_dir,  # Pass object masks for object-aware filling
                 hole_filling_options,
                 lambda p, m: report(0.70 + p * 0.20, f"[Hole-filling] {m}"),
             )
@@ -402,6 +485,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             self._hole_filling_stage.cleanup()
 
         self._video_stage = None
+        self._segmentation_stage = None
         self._training_stage = None
         self._hole_filling_stage = None
         self._export_stage = None
