@@ -1,5 +1,7 @@
 """Stage 1: Video Processing - Frame extraction and camera pose estimation."""
 
+import subprocess
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable
@@ -90,22 +92,112 @@ class VideoProcessingStage:
 
         report(1.0, "Video processing complete")
 
+        # Merge video metadata into result
+        metadata = {
+            "video_path": video_path,
+            "pose_estimator": self.pose_estimator,
+        }
+        if hasattr(self, "_video_metadata"):
+            metadata.update(self._video_metadata)
+
         return VideoProcessingResult(
             frames_dir=str(frames_dir),
             num_frames=num_frames,
             transforms_path=str(transforms_path),
             sparse_points_path=str(sparse_path / "points3D.ply") if sparse_path.exists() else None,
-            metadata={
-                "video_path": video_path,
-                "pose_estimator": self.pose_estimator,
-            },
+            metadata=metadata,
         )
 
     def _extract_frames(self, video_path: str, output_dir: Path) -> int:
-        """Extract frames from video using ffmpeg."""
-        # TODO: Implement ffmpeg frame extraction
-        # ffmpeg -i video.mp4 -vf "select=not(mod(n\,{interval}))" -vsync vfr frames/%04d.jpg
-        raise NotImplementedError("Frame extraction not yet implemented")
+        """
+        Extract frames from video using ffmpeg.
+
+        Args:
+            video_path: Path to input video file.
+            output_dir: Directory to save extracted frames.
+
+        Returns:
+            Number of frames extracted.
+        """
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        # Probe video to get metadata
+        probe_cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-select_streams", "v:0",
+            str(video_path),
+        ]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if probe_result.returncode != 0:
+            raise RuntimeError(f"ffprobe failed: {probe_result.stderr}")
+
+        probe_data = json.loads(probe_result.stdout)
+        if not probe_data.get("streams"):
+            raise ValueError(f"No video stream found in: {video_path}")
+
+        video_stream = probe_data["streams"][0]
+        self._video_metadata = {
+            "width": int(video_stream.get("width", 0)),
+            "height": int(video_stream.get("height", 0)),
+            "codec": video_stream.get("codec_name", "unknown"),
+        }
+
+        # Parse frame rate (can be "30/1" or "29.97")
+        fps_str = video_stream.get("r_frame_rate", "30/1")
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            fps = float(num) / float(den)
+        else:
+            fps = float(fps_str)
+        self._video_metadata["fps"] = fps
+
+        # Get total frame count if available
+        nb_frames = video_stream.get("nb_frames")
+        if nb_frames:
+            total_frames = int(nb_frames)
+        else:
+            # Estimate from duration
+            duration = float(video_stream.get("duration", 0))
+            total_frames = int(duration * fps)
+        self._video_metadata["total_frames"] = total_frames
+
+        # Calculate how many frames we'll actually extract
+        frames_after_interval = (total_frames + self.frame_interval - 1) // self.frame_interval
+        frames_to_extract = min(frames_after_interval, self.max_frames)
+
+        # Build ffmpeg command
+        # Use select filter to pick every Nth frame, limit total output
+        output_pattern = str(output_dir / "%04d.jpg")
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output files
+            "-i", str(video_path),
+            "-vf", f"select=not(mod(n\\,{self.frame_interval}))",
+            "-vsync", "vfr",  # Variable frame rate (only output selected frames)
+            "-frames:v", str(frames_to_extract),  # Limit number of output frames
+            "-q:v", "2",  # High quality JPEG (1-31, lower is better)
+            output_pattern,
+        ]
+
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr}")
+
+        # Count actual extracted frames
+        extracted_frames = list(output_dir.glob("*.jpg"))
+        num_frames = len(extracted_frames)
+
+        if num_frames == 0:
+            raise RuntimeError("No frames were extracted from video")
+
+        self._video_metadata["extracted_frames"] = num_frames
+        return num_frames
 
     def _run_hloc_pipeline(self, frames_dir: Path, transforms_path: Path, sparse_path: Path):
         """Run hloc + GLOMAP for pose estimation."""
