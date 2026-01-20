@@ -16,14 +16,15 @@ Brain Dance reconstructs 3D scenes from video input, creating Gaussian Splat rep
 ## How It Works
 
 ```text
-Video Input → Frame Extraction → Pose Estimation → 3DGS Training → AI Hole-Fill → Web Export
-              (ffmpeg)           (hloc/GLOMAP)     (Splatfacto)     (MVDream)      (SPZ)
+Video Input → Frame Extraction → Pose Estimation → Object Segmentation → 3DGS Training → AI Scene Completion → Web Export
+              (ffmpeg)           (hloc/GLOMAP)      (SAM-2)               (Splatfacto)     (MVDream)             (SPZ)
 ```
 
 1. **Video Processing**: Extract frames and estimate camera poses
-2. **3DGS Training**: Train 3D Gaussian Splatting model from multi-view images
-3. **Hole Filling**: AI fills gaps where the camera never looked
-4. **Web Export**: Compress and bundle for browser viewing
+2. **Object Segmentation**: SAM-2 tracks objects across frames for scene understanding
+3. **3DGS Training**: Train 3D Gaussian Splatting model from multi-view images
+4. **Scene Completion**: AI fills gaps where the camera never looked (using object masks)
+5. **Web Export**: Compress and bundle for browser viewing
 
 ## Quick Start
 
@@ -52,8 +53,9 @@ brain-dance/
 │   │   └── versecrafter.py    # Legacy (MoGe-V2 depth)
 │   ├── stages/             # Pipeline stages
 │   │   ├── video_processing.py
+│   │   ├── object_segmentation.py
 │   │   ├── gaussian_training.py
-│   │   ├── hole_filling.py
+│   │   ├── scene_completion.py
 │   │   └── web_export.py
 │   └── server.py           # FastAPI server
 ├── frontend/               # Next.js viewer (WIP)
@@ -63,9 +65,11 @@ brain-dance/
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — System design and pipeline details
+- [Architecture](docs/architecture.md) — System design and pipeline details
 - [API](docs/API.md) — REST API specification
+- [Setup](docs/setup.md) — Environment setup guide
 - [Roadmap](docs/ROADMAP.md) — Implementation phases
+- [Adding Adapters](docs/adding_models.md) — How to add new pipeline adapters
 
 ## Acknowledgments
 
