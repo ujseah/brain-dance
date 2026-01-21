@@ -31,12 +31,18 @@ except ImportError:
 
 # SAM-2 model configuration
 # Maps model size names to their config files, checkpoint names, URLs, and VRAM requirements
+#
+# NOTE: SHA256 checksums are intentionally None for prototype phase.
+# Downloads are protected by HTTPS (Meta's certificate). For production deployment,
+# compute and add checksums by downloading each model and running:
+#   sha256sum sam2_hiera_*.pt
+# This provides defense-in-depth against supply chain attacks.
 SAM2_MODELS = {
     "tiny": {
         "config": "sam2_hiera_t.yaml",
         "checkpoint": "sam2_hiera_tiny.pt",
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt",
-        "sha256": None,  # Will be populated after verification
+        "sha256": None,
         "vram_gb": 4.0,
     },
     "small": {
@@ -190,8 +196,10 @@ class ObjectSegmentationStage:
 
         # Get available VRAM
         available_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        # Reserve ~2GB for overhead (other operations, fragmentation)
-        usable_vram_gb = available_vram_gb - 2.0
+        # Reserve 10% or minimum 2GB for overhead (other operations, fragmentation)
+        # This scales better across GPU sizes (8GB vs 48GB)
+        overhead_gb = max(2.0, available_vram_gb * 0.1)
+        usable_vram_gb = available_vram_gb - overhead_gb
 
         requested_vram = SAM2_MODELS[requested_size]["vram_gb"]
 
