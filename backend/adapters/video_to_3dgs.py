@@ -23,7 +23,7 @@ class VideoProcessingOptions:
 
 @dataclass
 class SegmentationOptions:
-    """Options for object segmentation (Stage 1.5)."""
+    """Options for object segmentation (Stage 2)."""
 
     enabled: bool = True
     """Whether to run object segmentation. Critical for accurate scene completion."""
@@ -51,7 +51,7 @@ class TrainingOptions:
 
 @dataclass
 class SceneCompletionOptions:
-    """Options for AI scene completion (Stage 3)."""
+    """Options for AI scene completion (Stage 4)."""
 
     enabled: bool = True
     """Whether to run scene completion. This is the core feature of Brain Dance."""
@@ -106,10 +106,10 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
 
     Pipeline stages:
     1. Video Processing - Frame extraction + camera pose estimation
-    1.5. Object Segmentation - SAM-2 segmentation & tracking (critical for scene completion)
-    2. 3DGS Training - Train Splatfacto model from frames
-    3. AI Scene Completion - Generate unseen regions using object-aware inpainting
-    4. Web Export - Convert to compressed web format
+    2. Object Segmentation - SAM-2 segmentation & tracking (critical for scene completion)
+    3. 3DGS Training - Train Splatfacto model from frames
+    4. AI Scene Completion - Generate unseen regions using object-aware inpainting
+    5. Web Export - Convert to compressed web format
 
     Requirements:
         - CUDA 12.1+ (no Mac support for GPU stages)
@@ -200,7 +200,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         """
-        Stage 1.5: Segment and track objects across frames.
+        Stage 2: Segment and track objects across frames.
 
         This stage is CRITICAL for accurate scene completion. Without object-aware
         segmentation, gaps get filled with "texture soup" - averaged nearby
@@ -239,7 +239,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         """
-        Stage 2: Train 3DGS model from processed video data.
+        Stage 3: Train 3DGS model from processed video data.
 
         Args:
             processed_dir: Directory containing processed video data.
@@ -278,16 +278,16 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         """
-        Stage 3: AI Scene Completion - Generate unseen regions.
+        Stage 4: AI Scene Completion - Generate unseen regions.
 
         This is the core differentiator of Brain Dance. Uses object masks from
-        Stage 1.5 for object-aware completion, ensuring AI-generated regions
+        Stage 2 for object-aware completion, ensuring AI-generated regions
         respect object boundaries and scene context.
 
         Args:
             ply_path: Path to trained PLY file.
             output_dir: Directory to store outputs.
-            masks_dir: Path to masks from object segmentation (from Stage 1.5).
+            masks_dir: Path to masks from object segmentation (from Stage 2).
             options: Scene completion options.
             progress_callback: Optional callback(progress, message).
 
@@ -325,7 +325,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ):
         """
-        Stage 4: Export 3DGS for web viewing.
+        Stage 5: Export 3DGS for web viewing.
 
         Args:
             ply_path: Path to PLY file to export.
@@ -396,11 +396,11 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             lambda p, m: report(p * 0.20, f"[Video] {m}"),
         )
 
-        # Stage 1.5: Object Segmentation (20-35%)
+        # Stage 2: Object Segmentation (20-35%)
         # Critical for accurate hole-filling - identifies object boundaries
         masks_dir = None
         if segmentation_options.enabled:
-            report(0.20, "Stage 1.5: Segmenting objects")
+            report(0.20, "Stage 2: Segmenting objects")
             segmented = self.segment_objects(
                 processed.frames_dir,
                 str(output_path / "segmented"),
@@ -410,8 +410,8 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             if segmented:
                 masks_dir = segmented.masks_dir
 
-        # Stage 2: 3DGS Training (35-70%)
-        report(0.35, "Stage 2: Training 3DGS")
+        # Stage 3: 3DGS Training (35-70%)
+        report(0.35, "Stage 3: Training 3DGS")
         trained = self.train_3dgs(
             str(output_path / "processed"),
             str(output_path / "trained"),
@@ -419,12 +419,12 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
             lambda p, m: report(0.35 + p * 0.35, f"[Training] {m}"),
         )
 
-        # Stage 3: AI Scene Completion (70-90%)
+        # Stage 4: AI Scene Completion (70-90%)
         final_ply = trained.ply_path
         regions_completed = 0
 
         if scene_completion_options.enabled:
-            report(0.70, "Stage 3: Completing scene")
+            report(0.70, "Stage 4: Completing scene")
             completed = self.complete_scene(
                 trained.ply_path,
                 str(output_path / "completed"),
@@ -436,8 +436,8 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
                 final_ply = completed.ply_path
                 regions_completed = completed.num_regions_completed
 
-        # Stage 4: Web Export (90-100%)
-        report(0.90, "Stage 4: Exporting for web")
+        # Stage 5: Web Export (90-100%)
+        report(0.90, "Stage 5: Exporting for web")
         exported = self.export_for_web(
             final_ply,
             str(output_path / "export"),

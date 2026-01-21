@@ -1,4 +1,4 @@
-"""Stage 2: 3D Gaussian Splatting Training."""
+"""Stage 3: 3D Gaussian Splatting Training."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +26,7 @@ class GaussianTrainingResult:
 
 class GaussianTrainingStage:
     """
-    Stage 2: Train 3D Gaussian Splatting model from processed video data.
+    Stage 3: Train 3D Gaussian Splatting model from processed video data.
 
     This stage:
     1. Initializes Gaussians from sparse point cloud

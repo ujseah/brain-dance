@@ -1,4 +1,4 @@
-"""Stage 4: Web Export - Convert PLY to web-viewable format."""
+"""Stage 5: Web Export - Convert PLY to web-viewable format."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +27,7 @@ class WebExportResult:
 
 class WebExportStage:
     """
-    Stage 4: Export 3DGS for web viewing.
+    Stage 5: Export 3DGS for web viewing.
 
     This stage:
     1. Converts PLY to compressed format (SPZ or KSPLAT)
