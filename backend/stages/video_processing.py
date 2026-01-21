@@ -115,11 +115,14 @@ class VideoProcessingStage:
         if hasattr(self, "_video_metadata"):
             metadata.update(self._video_metadata)
 
+        # Check if sparse point cloud file exists (not just the directory)
+        sparse_ply_path = sparse_path / "points3D.ply"
+
         return VideoProcessingResult(
             frames_dir=str(frames_dir),
             num_frames=num_frames,
             transforms_path=str(transforms_path),
-            sparse_points_path=str(sparse_path / "points3D.ply") if sparse_path.exists() else None,
+            sparse_points_path=str(sparse_ply_path) if sparse_ply_path.exists() else None,
             metadata=metadata,
         )
 
@@ -352,6 +355,12 @@ class VideoProcessingStage:
 
         reconstruction = pycolmap.Reconstruction(sparse_dir)
 
+        # Validate reconstruction is not empty
+        if len(reconstruction.cameras) == 0:
+            raise RuntimeError("Reconstruction contains no cameras")
+        if len(reconstruction.images) == 0:
+            raise RuntimeError("Reconstruction contains no registered images")
+
         # 1. Reprojection errors
         reproj_errors = []
         for image in reconstruction.images.values():
@@ -431,6 +440,12 @@ class VideoProcessingStage:
         import pycolmap
 
         reconstruction = pycolmap.Reconstruction(sparse_dir)
+
+        # Validate reconstruction
+        if len(reconstruction.cameras) == 0:
+            raise RuntimeError("Cannot export: No cameras in reconstruction")
+        if len(reconstruction.images) == 0:
+            raise RuntimeError("Cannot export: No images registered in reconstruction")
 
         # Get camera (assume single camera)
         camera = list(reconstruction.cameras.values())[0]
@@ -544,56 +559,74 @@ class VideoProcessingStage:
 
         logger.info("Starting DUSt3R fallback pipeline...")
 
-        # Step 1: Load DUSt3R model
-        logger.info("Loading DUSt3R model...")
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model_name = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
+        model = None  # Initialize outside try block for cleanup
+        try:
+            # Step 1: Load DUSt3R model
+            logger.info("Loading DUSt3R model...")
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            model_name = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
 
-        model = AsymmetricCroCo3DStereo.from_pretrained(model_name).to(device)
-        model.eval()
+            try:
+                model = AsymmetricCroCo3DStereo.from_pretrained(model_name).to(device)
+                model.eval()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load DUSt3R model: {e}\n"
+                    "Possible causes:\n"
+                    "- Network connectivity issues\n"
+                    "- Insufficient disk space (~3GB required in ~/.cache/huggingface/)\n"
+                    "- Corrupted cache (try: rm -rf ~/.cache/huggingface/hub/models--naver--*)\n"
+                ) from e
 
-        # Step 2: Load frames
-        logger.info("Loading frames...")
-        frame_paths = sorted(frames_dir.glob("*.jpg"))
-        images = load_images([str(p) for p in frame_paths], size=512, verbose=False)
+            # Step 2: Load frames
+            logger.info("Loading frames...")
+            frame_paths = sorted(frames_dir.glob("*.jpg"))
+            images = load_images([str(p) for p in frame_paths], size=512, verbose=False)
 
-        # Step 3: Create pairs (adaptive strategy based on frame count)
-        num_frames = len(images)
-        if num_frames <= 30:
-            scene_graph = 'complete'
-            logger.info(f"Using complete pairing for {num_frames} frames")
-        elif num_frames <= 100:
-            scene_graph = 'swin'
-            logger.info(f"Using sliding window pairing for {num_frames} frames")
-        else:
-            scene_graph = 'one-ref'
-            logger.info(f"Using one-reference pairing for {num_frames} frames")
+            # Step 3: Create pairs (adaptive strategy based on frame count)
+            num_frames = len(images)
+            if num_frames <= 30:
+                scene_graph = 'complete'
+                logger.info(f"Using complete pairing for {num_frames} frames")
+            elif num_frames <= 100:
+                scene_graph = 'swin'
+                logger.info(f"Using sliding window pairing for {num_frames} frames")
+            else:
+                scene_graph = 'one-ref'
+                logger.info(f"Using one-reference pairing for {num_frames} frames")
 
-        pairs = make_pairs(images, scene_graph=scene_graph, prefilter=None, symmetrize=True)
+            pairs = make_pairs(images, scene_graph=scene_graph, prefilter=None, symmetrize=True)
 
-        # Step 4: Run inference
-        logger.info("Running DUSt3R inference...")
-        output = inference(pairs, model, device, batch_size=1, verbose=False)
+            # Step 4: Run inference
+            logger.info("Running DUSt3R inference...")
+            output = inference(pairs, model, device, batch_size=1, verbose=False)
 
-        # Step 5: Global alignment
-        logger.info("Running global alignment...")
-        scene = global_aligner(
-            output,
-            device=device,
-            mode=GlobalAlignerMode.PointCloudOptimizer
-        )
-        scene.compute_global_alignment(
-            init='mst',
-            niter=300,
-            schedule='cosine',
-            lr=0.01
-        )
+            # Step 5: Global alignment
+            logger.info("Running global alignment...")
+            scene = global_aligner(
+                output,
+                device=device,
+                mode=GlobalAlignerMode.PointCloudOptimizer
+            )
+            scene.compute_global_alignment(
+                init='mst',
+                niter=300,
+                schedule='cosine',
+                lr=0.01
+            )
 
-        # Step 6: Export to transforms.json
-        logger.info("Exporting to transforms.json...")
-        self._dust3r_to_transforms_json(scene, frame_paths, transforms_path)
+            # Step 6: Export to transforms.json
+            logger.info("Exporting to transforms.json...")
+            self._dust3r_to_transforms_json(scene, frame_paths, transforms_path)
 
-        logger.info("DUSt3R pipeline completed successfully")
+            logger.info("DUSt3R pipeline completed successfully")
+
+        finally:
+            # Cleanup GPU memory
+            if model is not None:
+                del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _dust3r_to_transforms_json(self, scene, frame_paths: list, output_path: Path):
         """Convert DUSt3R scene to Nerfstudio transforms.json format."""
