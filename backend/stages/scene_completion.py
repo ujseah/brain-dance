@@ -1,4 +1,4 @@
-"""Stage 3: AI Scene Completion - Generate unseen regions with diffusion."""
+"""Stage 4: AI Scene Completion - Generate unseen regions with diffusion."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,14 +43,14 @@ class SceneCompletionResult:
 
 class SceneCompletionStage:
     """
-    Stage 3: AI Scene Completion - The core differentiator of Brain Dance.
+    Stage 4: AI Scene Completion - The core differentiator of Brain Dance.
 
     This stage transforms a partial 3D reconstruction into a complete,
     explorable world by generating AI-powered content for unseen regions.
 
     Process:
     1. Detect incomplete regions via coverage/density analysis
-    2. Use object masks (from Stage 1.5) to understand scene context
+    2. Use object masks (from Stage 2) to understand scene context
     3. Render views at region boundaries
     4. Inpaint missing regions with MVDream (multi-view diffusion)
     5. Estimate depth for inpainted views (MoGe-V2)
@@ -63,7 +63,7 @@ class SceneCompletionStage:
         self.config = config or {}
         self.quality = self.config.get("quality", "balanced")  # fast, balanced, high
         self.num_inpaint_views = self.config.get("num_inpaint_views", 8)
-        self.masks_dir = self.config.get("masks_dir", None)  # Object masks from Stage 1.5
+        self.masks_dir = self.config.get("masks_dir", None)  # Object masks from Stage 2
         self.depth_model = None
         self.inpaint_model = None
 
@@ -170,7 +170,7 @@ class SceneCompletionStage:
 
     def _get_object_context(self, region: IncompleteRegion) -> dict:
         """
-        Get object context from Stage 1.5 masks for a region.
+        Get object context from Stage 2 masks for a region.
 
         This enables object-aware completion - understanding WHAT objects
         exist nearby helps generate coherent content that respects boundaries.
