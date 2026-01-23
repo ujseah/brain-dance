@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 
 # SAM-2 imports with graceful handling
 try:
-    from sam2.build_sam import build_sam2_video_predictor
+    from sam2.build_sam import build_sam2, build_sam2_video_predictor
     from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
     SAM2_AVAILABLE = True
 except ImportError:
@@ -65,6 +66,26 @@ SAM2_MODELS = {
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt",
         "sha256": None,
         "vram_gb": 16.0,
+    },
+}
+
+# Quality presets for mask generator
+# Controls trade-off between speed and segmentation quality
+SEGMENTATION_PRESETS = {
+    "fast": {
+        "points_per_side": 48,
+        "pred_iou_thresh": 0.6,
+        "stability_score_thresh": 0.75,
+    },
+    "balanced": {
+        "points_per_side": 32,
+        "pred_iou_thresh": 0.7,
+        "stability_score_thresh": 0.85,
+    },
+    "thorough": {
+        "points_per_side": 64,
+        "pred_iou_thresh": 0.8,
+        "stability_score_thresh": 0.9,
     },
 }
 
@@ -139,7 +160,12 @@ class ObjectSegmentationStage:
         self.config = config or {}
         self.keyframe_interval = self.config.get("keyframe_interval", 10)
         self.min_object_size = self.config.get("min_object_size", 100)
-        self.model = None
+        self.quality_preset = self.config.get("quality_preset", "balanced")
+
+        # Dual-model architecture: image model for Phase 2, video predictor for Phase 3
+        self.image_model = None
+        self.mask_generator = None
+        self.video_predictor = None
 
         # Device selection with CPU fallback for testing
         self.allow_cpu = self.config.get("allow_cpu", False)
@@ -342,9 +368,51 @@ class ObjectSegmentationStage:
                 sha256.update(chunk)
         return sha256.hexdigest()
 
-    def _load_sam2_model(self) -> None:
+    def _get_quality_preset(self) -> dict:
         """
-        Load SAM-2 video predictor model.
+        Get mask generator parameters based on quality preset.
+
+        Returns:
+            Dictionary with points_per_side, pred_iou_thresh, stability_score_thresh
+        """
+        preset_name = self.quality_preset
+        if preset_name not in SEGMENTATION_PRESETS:
+            logger.warning(
+                f"[SEG-WARN-003] Invalid quality preset '{preset_name}', using 'balanced'"
+            )
+            preset_name = "balanced"
+        return SEGMENTATION_PRESETS[preset_name]
+
+    def _validate_path(self, path: str, param_name: str) -> Path:
+        """
+        Validate and resolve a path, preventing path traversal attacks.
+
+        Args:
+            path: Path string to validate
+            param_name: Parameter name for error messages
+
+        Returns:
+            Resolved Path object
+
+        Raises:
+            ValueError: If path is invalid or attempts traversal
+        """
+        resolved = Path(path).resolve()
+
+        # Check for path traversal attempts
+        if ".." in Path(path).parts:
+            raise ValueError(
+                f"[SEG-ERR-009] Invalid {param_name}: path traversal not allowed"
+            )
+
+        return resolved
+
+    def _load_image_model(self) -> None:
+        """
+        Load SAM-2 image model and automatic mask generator for Phase 2.
+
+        This model is used for keyframe segmentation to discover objects.
+        Must be unloaded before loading video predictor to manage VRAM.
 
         Raises:
             RuntimeError: If SAM-2 not installed or model loading fails
@@ -372,9 +440,114 @@ class ObjectSegmentationStage:
         checkpoint_path = self._get_checkpoint_path(selected_size)
 
         try:
-            logger.info(f"Loading SAM-2 {selected_size} model...")
+            logger.info(f"Loading SAM-2 image model ({selected_size})...")
 
-            self.model = build_sam2_video_predictor(
+            # Build the base SAM-2 model
+            self.image_model = build_sam2(
+                config_file=model_info["config"],
+                ckpt_path=str(checkpoint_path),
+            )
+            self.image_model.to(self.device)
+
+            # Create mask generator with quality preset
+            preset = self._get_quality_preset()
+            self.mask_generator = SAM2AutomaticMaskGenerator(
+                model=self.image_model,
+                points_per_side=preset["points_per_side"],
+                pred_iou_thresh=preset["pred_iou_thresh"],
+                stability_score_thresh=preset["stability_score_thresh"],
+                min_mask_region_area=self.min_object_size,
+            )
+
+            load_time = time.perf_counter() - start_time
+
+            # Record metrics
+            self.metrics["image_model_load_time_seconds"] = load_time
+            self.metrics["model_size"] = selected_size
+            self.metrics["requested_model_size"] = requested_size
+            self.metrics["quality_preset"] = self.quality_preset
+            self.metrics["device"] = self.device
+
+            if torch.cuda.is_available():
+                self.metrics["image_model_vram_allocated_gb"] = (
+                    torch.cuda.memory_allocated() / 1e9
+                )
+                self.metrics["image_model_vram_reserved_gb"] = (
+                    torch.cuda.memory_reserved() / 1e9
+                )
+
+            logger.info(
+                f"SAM-2 image model loaded in {load_time:.2f}s on {self.device}"
+            )
+            logger.info(f"Quality preset: {self.quality_preset} ({preset})")
+
+        except Exception as e:
+            raise RuntimeError(
+                f"[SEG-ERR-007] Failed to load SAM-2 image model.\n"
+                f"Model: {selected_size}\n"
+                f"Config: {model_info['config']}\n"
+                f"Checkpoint: {checkpoint_path}\n"
+                f"Error: {e}"
+            ) from e
+
+    def _unload_image_model(self) -> None:
+        """
+        Unload image model and mask generator to free VRAM.
+
+        CRITICAL: Must be called after Phase 2 (keyframe segmentation)
+        and before Phase 3 (video tracking) to avoid OOM on 24GB GPUs.
+        """
+        if self.mask_generator is not None:
+            del self.mask_generator
+            self.mask_generator = None
+            logger.info("Mask generator unloaded")
+
+        if self.image_model is not None:
+            del self.image_model
+            self.image_model = None
+            logger.info("SAM-2 image model unloaded")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("GPU memory cleared after image model unload")
+
+    def _load_video_predictor(self) -> None:
+        """
+        Load SAM-2 video predictor model for Phase 3 tracking.
+
+        This model is used for object tracking across frames.
+        Should only be loaded after image model is unloaded to manage VRAM.
+
+        Raises:
+            RuntimeError: If SAM-2 not installed or model loading fails
+        """
+        if not SAM2_AVAILABLE:
+            raise RuntimeError(
+                "[SEG-ERR-005] SAM-2 not installed.\n"
+                "Install: pip install git+https://github.com/facebookresearch/segment-anything-2.git"
+            )
+
+        start_time = time.perf_counter()
+
+        # Auto-select model based on VRAM
+        requested_size = self.config.get("model_size", "large")
+        if requested_size not in SAM2_MODELS:
+            raise ValueError(
+                f"[SEG-ERR-006] Invalid model size: {requested_size}. "
+                f"Valid options: {list(SAM2_MODELS.keys())}"
+            )
+
+        selected_size = self._select_model_for_vram(requested_size)
+        model_info = SAM2_MODELS[selected_size]
+
+        # Get or download checkpoint
+        checkpoint_path = self._get_checkpoint_path(selected_size)
+
+        try:
+            logger.info(f"Loading SAM-2 video predictor ({selected_size})...")
+
+            self.video_predictor = build_sam2_video_predictor(
                 config_file=model_info["config"],
                 ckpt_path=str(checkpoint_path),
                 device=self.device,
@@ -383,35 +556,61 @@ class ObjectSegmentationStage:
             load_time = time.perf_counter() - start_time
 
             # Record metrics for observability
-            self.metrics["model_load_time_seconds"] = load_time
+            self.metrics["video_predictor_load_time_seconds"] = load_time
             self.metrics["model_size"] = selected_size
             self.metrics["requested_model_size"] = requested_size
             self.metrics["device"] = self.device
 
             if torch.cuda.is_available():
-                self.metrics["vram_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
-                self.metrics["vram_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+                self.metrics["video_predictor_vram_allocated_gb"] = (
+                    torch.cuda.memory_allocated() / 1e9
+                )
+                self.metrics["video_predictor_vram_reserved_gb"] = (
+                    torch.cuda.memory_reserved() / 1e9
+                )
 
             logger.info(
-                f"SAM-2 loaded successfully in {load_time:.2f}s on {self.device}"
+                f"SAM-2 video predictor loaded in {load_time:.2f}s on {self.device}"
             )
-            logger.info(f"Metrics: {self.metrics}")
 
         except Exception as e:
             raise RuntimeError(
-                f"[SEG-ERR-007] Failed to load SAM-2 model.\n"
+                f"[SEG-ERR-007] Failed to load SAM-2 video predictor.\n"
                 f"Model: {selected_size}\n"
                 f"Config: {model_info['config']}\n"
                 f"Checkpoint: {checkpoint_path}\n"
                 f"Error: {e}"
             ) from e
 
+    def _unload_video_predictor(self) -> None:
+        """Unload video predictor to free VRAM."""
+        if self.video_predictor is not None:
+            del self.video_predictor
+            self.video_predictor = None
+            logger.info("SAM-2 video predictor unloaded")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("GPU memory cleared after video predictor unload")
+
     def cleanup(self) -> None:
-        """Clean up model and free GPU memory."""
-        if self.model is not None:
-            del self.model
-            self.model = None
-            logger.info("SAM-2 model unloaded")
+        """Clean up all models and free GPU memory."""
+        # Unload image model if loaded
+        if self.mask_generator is not None:
+            del self.mask_generator
+            self.mask_generator = None
+
+        if self.image_model is not None:
+            del self.image_model
+            self.image_model = None
+            logger.info("SAM-2 image model unloaded")
+
+        # Unload video predictor if loaded
+        if self.video_predictor is not None:
+            del self.video_predictor
+            self.video_predictor = None
+            logger.info("SAM-2 video predictor unloaded")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -427,6 +626,10 @@ class ObjectSegmentationStage:
         """
         Segment and track objects across video frames.
 
+        Uses dual-model architecture:
+        - Phase 2: Load image model → segment keyframes → unload
+        - Phase 3: Load video predictor → track objects → unload
+
         Args:
             frames_dir: Directory containing extracted frames.
             output_dir: Directory to store segmentation outputs.
@@ -434,6 +637,10 @@ class ObjectSegmentationStage:
 
         Returns:
             ObjectSegmentationResult with paths to masks and metadata.
+
+        Note:
+            For videos >300 frames on 24GB GPUs, consider reducing frame count
+            or using a smaller model size to avoid OOM errors.
         """
 
         def report(pct: float, msg: str):
@@ -441,8 +648,9 @@ class ObjectSegmentationStage:
                 progress_callback(pct, msg)
             logger.info(f"[{pct*100:.0f}%] {msg}")
 
-        frames_path = Path(frames_dir)
-        output_path = Path(output_dir)
+        # Validate and resolve paths (security: prevent path traversal)
+        frames_path = self._validate_path(frames_dir, "frames_dir")
+        output_path = self._validate_path(output_dir, "output_dir")
         output_path.mkdir(parents=True, exist_ok=True)
 
         masks_dir = output_path / "masks"
@@ -453,26 +661,73 @@ class ObjectSegmentationStage:
             frames_path.glob("*.png")
         )
         if not frame_files:
-            raise ValueError(f"No frames found in {frames_dir}")
+            raise ValueError(f"[SEG-ERR-012] No frames found in {frames_dir}")
 
         report(0.0, f"Found {len(frame_files)} frames for segmentation")
 
-        # Step 1: Load SAM-2 model
-        report(0.05, "Loading SAM-2 model")
-        self._load_sam2_model()
+        # ===== PHASE 2: Keyframe Segmentation =====
+        # Load image model with mask generator
+        report(0.05, "Loading SAM-2 image model for keyframe segmentation")
+        self._load_image_model()
 
-        # Step 2: Segment keyframes to discover objects
-        report(0.1, "Segmenting keyframes to discover objects")
-        keyframe_indices = list(range(0, len(frame_files), self.keyframe_interval))
-        initial_objects = self._segment_keyframes(frame_files, keyframe_indices)
-        report(0.3, f"Discovered {len(initial_objects)} objects in keyframes")
+        try:
+            # Sample keyframes (always includes first and last)
+            keyframe_indices = self._sample_keyframes(frame_files)
+            report(0.1, f"Selected {len(keyframe_indices)} keyframes for detection")
 
-        # Step 3: Track objects across all frames
-        report(0.3, "Tracking objects across all frames")
-        tracked_objects = self._track_objects(frame_files, initial_objects, masks_dir)
-        report(0.9, f"Tracked {len(tracked_objects)} objects across {len(frame_files)} frames")
+            # Segment keyframes to discover objects
+            def keyframe_progress(pct: float, msg: str):
+                # Map keyframe progress (0-1) to overall progress (0.1-0.3)
+                overall_pct = 0.1 + pct * 0.2
+                report(overall_pct, msg)
 
-        # Step 4: Save metadata
+            initial_detections = self._segment_keyframes(
+                frame_files, keyframe_indices, keyframe_progress
+            )
+            report(0.3, f"Discovered {len(initial_detections)} unique objects in keyframes")
+
+        finally:
+            # CRITICAL: Unload image model to free VRAM before loading video predictor
+            self._unload_image_model()
+            report(0.32, "Image model unloaded, VRAM freed")
+
+        # Handle case where no objects detected
+        if not initial_detections:
+            logger.warning(
+                "[SEG-WARN-006] No objects detected. Returning empty result."
+            )
+            metadata_path = output_path / "object_metadata.json"
+            self._save_metadata([], metadata_path)
+
+            return ObjectSegmentationResult(
+                masks_dir=str(masks_dir),
+                num_objects=0,
+                objects=[],
+                metadata_path=str(metadata_path),
+                metadata={
+                    "num_frames": len(frame_files),
+                    "keyframe_interval": self.keyframe_interval,
+                    "model_size": self.metrics.get("model_size", "unknown"),
+                    "quality_preset": self.quality_preset,
+                    "device": self.device,
+                    "warning": "No objects detected in video",
+                },
+            )
+
+        # ===== PHASE 3: Object Tracking (placeholder for future implementation) =====
+        report(0.35, "Loading SAM-2 video predictor for object tracking")
+        self._load_video_predictor()
+
+        try:
+            report(0.4, "Tracking objects across all frames")
+            tracked_objects = self._track_objects(frame_files, initial_detections, masks_dir)
+            report(0.9, f"Tracked {len(tracked_objects)} objects across {len(frame_files)} frames")
+
+        finally:
+            # Cleanup video predictor
+            self._unload_video_predictor()
+
+        # ===== PHASE 4: Save Metadata =====
         report(0.95, "Saving segmentation metadata")
         metadata_path = output_path / "object_metadata.json"
         self._save_metadata(tracked_objects, metadata_path)
@@ -487,37 +742,244 @@ class ObjectSegmentationStage:
             metadata={
                 "num_frames": len(frame_files),
                 "keyframe_interval": self.keyframe_interval,
+                "num_keyframes": len(keyframe_indices),
                 "model_size": self.metrics.get("model_size", "unknown"),
+                "quality_preset": self.quality_preset,
                 "device": self.device,
             },
         )
 
+    def _sample_keyframes(self, frame_files: List[Path]) -> List[int]:
+        """
+        Select keyframe indices for object detection.
+
+        Always includes first and last frames for boundary coverage.
+        If keyframe_interval is larger than num_frames, returns all frames.
+
+        Args:
+            frame_files: List of frame file paths
+
+        Returns:
+            Sorted list of keyframe indices
+        """
+        num_frames = len(frame_files)
+
+        if num_frames == 0:
+            return []
+
+        if num_frames <= 2:
+            # Very short video: use all frames
+            return list(range(num_frames))
+
+        # Always include first and last frame
+        keyframes = {0, num_frames - 1}
+
+        # Add intermediate keyframes at regular intervals
+        for idx in range(self.keyframe_interval, num_frames - 1, self.keyframe_interval):
+            keyframes.add(idx)
+
+        return sorted(keyframes)
+
+    def _segment_single_keyframe(
+        self, image_path: Path, keyframe_idx: int
+    ) -> List[dict]:
+        """
+        Run automatic mask generation on a single keyframe.
+
+        Args:
+            image_path: Path to the frame image
+            keyframe_idx: Index of this keyframe in the video
+
+        Returns:
+            List of detection dictionaries with mask, bbox, area, confidence, frame_idx
+        """
+        if self.mask_generator is None:
+            raise RuntimeError(
+                "[SEG-ERR-008] Mask generator not initialized. "
+                "Call _load_image_model() first."
+            )
+
+        # Load image as RGB numpy array
+        image = Image.open(image_path).convert("RGB")
+        image_np = np.array(image)
+
+        # Validate image format
+        if image_np.ndim != 3 or image_np.shape[2] != 3:
+            raise RuntimeError(
+                f"[SEG-ERR-011] Expected RGB image, got shape {image_np.shape}"
+            )
+
+        # Run mask generation with mixed precision for efficiency
+        with torch.cuda.amp.autocast():
+            masks = self.mask_generator.generate(image_np)
+
+        # Convert to detection dictionaries
+        detections = []
+        for mask_info in masks:
+            # Filter by minimum object size (already done by mask_generator,
+            # but double-check in case of API changes)
+            if mask_info["area"] < self.min_object_size:
+                continue
+
+            detections.append({
+                "mask": mask_info["segmentation"],  # Binary mask (H, W)
+                "bbox": mask_info["bbox"],  # [x, y, width, height]
+                "area": mask_info["area"],  # Pixel count
+                "confidence": mask_info["stability_score"],  # 0-1
+                "frame_idx": keyframe_idx,
+            })
+
+        return detections
+
+    def _compute_mask_iou(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
+        """
+        Compute Intersection over Union (IoU) between two binary masks.
+
+        Args:
+            mask1: First binary mask (H, W)
+            mask2: Second binary mask (H, W)
+
+        Returns:
+            IoU value between 0 and 1
+        """
+        intersection = np.logical_and(mask1, mask2).sum()
+        union = np.logical_or(mask1, mask2).sum()
+
+        if union == 0:
+            return 0.0
+
+        return float(intersection / union)
+
+    def _merge_keyframe_detections(
+        self, detections: List[dict], iou_threshold: float = 0.5
+    ) -> List[dict]:
+        """
+        Merge overlapping detections across keyframes.
+
+        Uses IoU-based clustering to identify the same object detected
+        in multiple keyframes. Keeps the detection with highest confidence.
+
+        Args:
+            detections: List of all detections from all keyframes
+            iou_threshold: Minimum IoU to consider detections as same object
+
+        Returns:
+            Deduplicated list of detections
+        """
+        if not detections:
+            return []
+
+        # Sort by confidence descending (keep best detection per cluster)
+        sorted_detections = sorted(
+            detections, key=lambda d: d["confidence"], reverse=True
+        )
+
+        merged = []
+        used = [False] * len(sorted_detections)
+
+        for i, det_i in enumerate(sorted_detections):
+            if used[i]:
+                continue
+
+            # This detection is a new cluster representative
+            merged.append(det_i)
+            used[i] = True
+
+            # Find all overlapping detections and mark as used
+            for j, det_j in enumerate(sorted_detections):
+                if used[j] or i == j:
+                    continue
+
+                # Only compare detections from different keyframes
+                if det_i["frame_idx"] == det_j["frame_idx"]:
+                    continue
+
+                iou = self._compute_mask_iou(det_i["mask"], det_j["mask"])
+                if iou >= iou_threshold:
+                    used[j] = True
+
+        logger.info(
+            f"Merged {len(detections)} detections into {len(merged)} unique objects"
+        )
+        return merged
+
     def _segment_keyframes(
-        self, frame_files: List[Path], keyframe_indices: List[int]
-    ) -> List[SegmentedObject]:
+        self,
+        frame_files: List[Path],
+        keyframe_indices: List[int],
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+    ) -> List[dict]:
         """
         Run automatic mask generation on keyframes to discover objects.
 
         Uses SAM-2's automatic mask generator to find all objects in keyframes,
-        then initializes tracking for each unique object.
+        then merges overlapping detections across keyframes.
 
-        Note: This is a Phase 2 implementation - currently raises NotImplementedError.
+        Args:
+            frame_files: List of all frame file paths
+            keyframe_indices: Indices of keyframes to process
+            progress_callback: Optional callback for progress reporting
+
+        Returns:
+            List of unique object detections (dict with mask, bbox, area, confidence, frame_idx)
         """
-        # TODO: Implement in Phase 2
-        # 1. For each keyframe:
-        #    - Run SAM-2 automatic mask generation
-        #    - Filter by min_object_size
-        #    - Store initial masks and prompts for tracking
-        # 2. Merge overlapping detections across keyframes
-        # 3. Return list of unique objects to track
-        raise NotImplementedError(
-            "Keyframe segmentation not yet implemented (Phase 2)"
-        )
+        if self.mask_generator is None:
+            raise RuntimeError(
+                "[SEG-ERR-008] Mask generator not initialized. "
+                "Call _load_image_model() first."
+            )
+
+        all_detections = []
+        num_keyframes = len(keyframe_indices)
+
+        for i, keyframe_idx in enumerate(keyframe_indices):
+            if keyframe_idx >= len(frame_files):
+                logger.warning(
+                    f"[SEG-WARN-004] Keyframe index {keyframe_idx} out of range, skipping"
+                )
+                continue
+
+            frame_path = frame_files[keyframe_idx]
+
+            # Report progress per keyframe
+            if progress_callback:
+                progress = i / num_keyframes
+                progress_callback(progress, f"Segmenting keyframe {i+1}/{num_keyframes}")
+
+            logger.info(f"Segmenting keyframe {i+1}/{num_keyframes}: {frame_path.name}")
+
+            try:
+                detections = self._segment_single_keyframe(frame_path, keyframe_idx)
+                all_detections.extend(detections)
+                logger.info(f"  Found {len(detections)} objects in keyframe {keyframe_idx}")
+
+            except Exception as e:
+                # Fail-fast for prototype: any keyframe failure raises error
+                raise RuntimeError(
+                    f"[SEG-ERR-010] Failed to segment keyframe {keyframe_idx} ({frame_path}).\n"
+                    f"Error: {e}"
+                ) from e
+
+        # Handle case where no objects were detected
+        if not all_detections:
+            logger.warning(
+                "[SEG-WARN-005] No objects detected in any keyframe. "
+                "Video may be empty or min_object_size threshold too high."
+            )
+            return []
+
+        # Merge overlapping detections across keyframes
+        merged_detections = self._merge_keyframe_detections(all_detections)
+
+        if progress_callback:
+            progress_callback(1.0, f"Discovered {len(merged_detections)} unique objects")
+
+        return merged_detections
 
     def _track_objects(
         self,
         frame_files: List[Path],
-        initial_objects: List[SegmentedObject],
+        initial_detections: List[dict],
         output_dir: Path,
     ) -> List[SegmentedObject]:
         """
@@ -526,14 +988,24 @@ class ObjectSegmentationStage:
         SAM-2's video tracking propagates masks forward and backward in time,
         maintaining consistent object identities.
 
+        Args:
+            frame_files: List of all frame file paths
+            initial_detections: List of detection dicts from Phase 2 keyframe segmentation
+                Each dict has: mask, bbox, area, confidence, frame_idx
+            output_dir: Directory to save mask PNGs
+
+        Returns:
+            List of SegmentedObject with mask_paths and frame_indices populated
+
         Note: This is a Phase 3 implementation - currently raises NotImplementedError.
         """
         # TODO: Implement in Phase 3
         # 1. Initialize SAM-2 video predictor with video frames
-        # 2. Add initial prompts (masks/points) for each object from keyframes
-        # 3. Propagate masks through video
+        # 2. For each detection in initial_detections:
+        #    - Add mask prompt at the detection's frame_idx
+        # 3. Propagate masks forward and backward through video
         # 4. Save masks to output_dir/{object_id}/{frame_idx:04d}.png
-        # 5. Update SegmentedObject with mask_paths and frame_indices
+        # 5. Return List[SegmentedObject] with mask_paths and frame_indices
         raise NotImplementedError(
             "Object tracking not yet implemented (Phase 3)"
         )

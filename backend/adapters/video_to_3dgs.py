@@ -35,7 +35,10 @@ class SegmentationOptions:
     """Minimum object size in pixels to track."""
 
     model_size: str = "large"
-    """SAM-2 model size: 'tiny', 'small', 'base', 'large'."""
+    """SAM-2 model size: 'tiny', 'small', 'base_plus', 'large'."""
+
+    quality_preset: str = "balanced"
+    """Quality preset for mask generation: 'fast', 'balanced', 'thorough'."""
 
 
 @dataclass
@@ -227,6 +230,7 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
                 "keyframe_interval": options.keyframe_interval,
                 "min_object_size": options.min_object_size,
                 "model_size": options.model_size,
+                "quality_preset": options.quality_preset,
             })
 
         return self._segmentation_stage.segment(frames_dir, output_dir, progress_callback)
