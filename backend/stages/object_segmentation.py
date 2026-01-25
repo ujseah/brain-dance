@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, List
@@ -313,7 +314,14 @@ class ObjectSegmentationStage:
                         if block_num % 500 == 0:
                             logger.info(f"Download progress: {percent:.1f}%")
 
-                urllib.request.urlretrieve(url, temp_path, reporthook=report_progress)
+                # Set socket timeout to prevent indefinite hangs on slow/stalled connections
+                import socket
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(300)  # 5 minutes for large model files
+                try:
+                    urllib.request.urlretrieve(url, temp_path, reporthook=report_progress)
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
 
                 # Verify checksum if available
                 if expected_sha256:
@@ -1074,12 +1082,21 @@ class ObjectSegmentationStage:
         start_time = time.perf_counter()
 
         try:
-            # Use directory path - SAM-2 loads frames on demand
-            inference_state = self.video_predictor.init_state(
-                video_path=str(frames_dir),
-                offload_video_to_cpu=self.config.get("offload_video_to_cpu", False),
-                offload_state_to_cpu=self.config.get("offload_state_to_cpu", False),
+            # Use autocast for BFloat16 compatibility with SAM-2 video predictor
+            # See: https://github.com/facebookresearch/sam2/issues/577
+            autocast_ctx = (
+                torch.autocast("cuda", dtype=torch.bfloat16)
+                if self.device == "cuda"
+                else nullcontext()
             )
+
+            with autocast_ctx:
+                # Use directory path - SAM-2 loads frames on demand
+                inference_state = self.video_predictor.init_state(
+                    video_path=str(frames_dir),
+                    offload_video_to_cpu=self.config.get("offload_video_to_cpu", False),
+                    offload_state_to_cpu=self.config.get("offload_state_to_cpu", False),
+                )
 
             init_time = time.perf_counter() - start_time
             self.metrics["video_state_init_time_seconds"] = init_time
@@ -1115,45 +1132,54 @@ class ObjectSegmentationStage:
 
         object_info = {}
 
-        for obj_id, detection in enumerate(detections):
-            frame_idx = detection["frame_idx"]
-            mask = detection["mask"]
-            img_height, img_width = mask.shape
+        # Use autocast for BFloat16 compatibility with SAM-2 video predictor
+        # See: https://github.com/facebookresearch/sam2/issues/577
+        autocast_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if self.device == "cuda"
+            else nullcontext()
+        )
 
-            # Convert bbox from XYWH to XYXY format
-            x, y, w, h = detection["bbox"]
-            bbox_xyxy = [x, y, x + w, y + h]
+        with autocast_ctx:
+            for obj_id, detection in enumerate(detections):
+                frame_idx = detection["frame_idx"]
+                mask = detection["mask"]
+                img_height, img_width = mask.shape
 
-            # Normalize to 0-1 range for SAM-2
-            bbox_normalized = self._normalize_bbox(bbox_xyxy, img_height, img_width)
+                # Convert bbox from XYWH to XYXY format
+                x, y, w, h = detection["bbox"]
+                bbox_xyxy = [x, y, x + w, y + h]
 
-            try:
-                # Add bounding box prompt to video predictor
-                _, out_obj_ids, out_masks = self.video_predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=obj_id,
-                    box=np.array(bbox_normalized),
-                    normalize_coords=True,
-                )
+                # Normalize to 0-1 range for SAM-2
+                bbox_normalized = self._normalize_bbox(bbox_xyxy, img_height, img_width)
 
-                object_info[obj_id] = {
-                    "source_frame": frame_idx,
-                    "source_confidence": detection["confidence"],
-                    "source_bbox": detection["bbox"],
-                }
+                try:
+                    # Add bounding box prompt to video predictor
+                    _, out_obj_ids, out_masks = self.video_predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_id,
+                        box=np.array(bbox_normalized),
+                        normalize_coords=True,
+                    )
 
-                logger.debug(
-                    f"Added prompt for object {obj_id} at frame {frame_idx} "
-                    f"with bbox {bbox_normalized}"
-                )
+                    object_info[obj_id] = {
+                        "source_frame": frame_idx,
+                        "source_confidence": detection["confidence"],
+                        "source_bbox": detection["bbox"],
+                    }
 
-            except Exception as e:
-                logger.error(
-                    f"[SEG-ERR-015] Failed to add prompt for object {obj_id} "
-                    f"at frame {frame_idx}: {e}"
-                )
-                raise
+                    logger.debug(
+                        f"Added prompt for object {obj_id} at frame {frame_idx} "
+                        f"with bbox {bbox_normalized}"
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"[SEG-ERR-015] Failed to add prompt for object {obj_id} "
+                        f"at frame {frame_idx}: {e}"
+                    )
+                    raise
 
         logger.info(f"Successfully added {len(object_info)} object prompts")
         return object_info
@@ -1185,45 +1211,54 @@ class ObjectSegmentationStage:
         all_masks = {}
         frames_processed = 0
 
+        # Use autocast for BFloat16 compatibility with SAM-2 video predictor
+        # See: https://github.com/facebookresearch/sam2/issues/577
+        autocast_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if self.device == "cuda"
+            else nullcontext()
+        )
+
         try:
-            for frame_idx, obj_ids, mask_logits in self.video_predictor.propagate_in_video(
-                inference_state=inference_state,
-            ):
-                frames_processed += 1
+            with autocast_ctx:
+                for frame_idx, obj_ids, mask_logits in self.video_predictor.propagate_in_video(
+                    inference_state=inference_state,
+                ):
+                    frames_processed += 1
 
-                if progress_callback:
-                    progress = frames_processed / num_frames
-                    progress_callback(
-                        progress, f"Tracking frame {frames_processed}/{num_frames}"
-                    )
+                    if progress_callback:
+                        progress = frames_processed / num_frames
+                        progress_callback(
+                            progress, f"Tracking frame {frames_processed}/{num_frames}"
+                        )
 
-                frame_data = []
+                    frame_data = []
 
-                # Process each object's mask for this frame
-                for i, obj_id in enumerate(obj_ids):
-                    # Convert logits to binary mask
-                    # mask_logits shape: (num_objects, H, W) or (1, H, W) per object
-                    mask = (mask_logits[i] > 0.0).cpu().numpy()
+                    # Process each object's mask for this frame
+                    for i, obj_id in enumerate(obj_ids):
+                        # Convert logits to binary mask
+                        # mask_logits shape: (num_objects, H, W) or (1, H, W) per object
+                        mask = (mask_logits[i] > 0.0).cpu().numpy()
 
-                    # Skip empty masks (object not visible in this frame)
-                    if not mask.any():
-                        continue
+                        # Skip empty masks (object not visible in this frame)
+                        if not mask.any():
+                            continue
 
-                    # Compute per-frame metadata for Stage 4
-                    bbox = self._mask_to_bbox(mask)
-                    centroid = self._mask_to_centroid(mask)
-                    area = int(mask.sum())
+                        # Compute per-frame metadata for Stage 4
+                        bbox = self._mask_to_bbox(mask)
+                        centroid = self._mask_to_centroid(mask)
+                        area = int(mask.sum())
 
-                    frame_data.append({
-                        "object_id": int(obj_id),
-                        "mask": mask,
-                        "bbox": bbox,
-                        "centroid": centroid,
-                        "area": area,
-                    })
+                        frame_data.append({
+                            "object_id": int(obj_id),
+                            "mask": mask,
+                            "bbox": bbox,
+                            "centroid": centroid,
+                            "area": area,
+                        })
 
-                if frame_data:
-                    all_masks[frame_idx] = frame_data
+                    if frame_data:
+                        all_masks[frame_idx] = frame_data
 
             propagate_time = time.perf_counter() - start_time
             self.metrics["propagation_time_seconds"] = propagate_time
@@ -1498,7 +1533,7 @@ class ObjectSegmentationStage:
             "metrics": self.metrics,
         }
 
-        with open(metadata_path, "w") as f:
+        with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
         logger.info(f"Saved enhanced metadata to {metadata_path}")
@@ -1653,7 +1688,7 @@ class ObjectSegmentationStage:
             "metrics": self.metrics,
         }
 
-        with open(metadata_path, "w") as f:
+        with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
         logger.info(f"Saved metadata to {metadata_path}")
