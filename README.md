@@ -15,6 +15,8 @@ Brain Dance reconstructs 3D scenes from video input, creating Gaussian Splat rep
 
 ## How It Works
 
+<img width="4022" height="3075" alt="shapes at 26-01-24 22 38 55" src="https://github.com/user-attachments/assets/8e42058d-7212-4903-9f11-f9f81f30d8c2" />
+
 ```text
 Video Input → Frame Extraction → Pose Estimation → Object Segmentation → 3DGS Training → AI Scene Completion → Web Export
               (ffmpeg)           (hloc/GLOMAP)      (SAM-2)               (Splatfacto)     (MVDream)             (SPZ)
