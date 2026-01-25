@@ -714,23 +714,26 @@ class ObjectSegmentationStage:
                 },
             )
 
-        # ===== PHASE 3: Object Tracking (placeholder for future implementation) =====
+        # ===== PHASE 3: Object Tracking =====
         report(0.35, "Loading SAM-2 video predictor for object tracking")
         self._load_video_predictor()
 
         try:
             report(0.4, "Tracking objects across all frames")
-            tracked_objects = self._track_objects(frame_files, initial_detections, masks_dir)
-            report(0.9, f"Tracked {len(tracked_objects)} objects across {len(frame_files)} frames")
+            tracked_objects = self._track_objects(
+                frame_files,
+                initial_detections,
+                output_path,  # Pass output_path, not masks_dir
+                progress_callback=lambda p, m: report(0.4 + p * 0.55, m),
+            )
+            report(0.95, f"Tracked {len(tracked_objects)} objects across {len(frame_files)} frames")
 
         finally:
             # Cleanup video predictor
             self._unload_video_predictor()
 
-        # ===== PHASE 4: Save Metadata =====
-        report(0.95, "Saving segmentation metadata")
+        # Metadata is now saved by _track_objects with enhanced format
         metadata_path = output_path / "object_metadata.json"
-        self._save_metadata(tracked_objects, metadata_path)
 
         report(1.0, "Object segmentation complete")
 
@@ -976,39 +979,660 @@ class ObjectSegmentationStage:
 
         return merged_detections
 
+    # =========================================================================
+    # Phase 3: Video Object Tracking Helper Methods
+    # =========================================================================
+
+    def _mask_to_bbox(self, mask: np.ndarray) -> List[float]:
+        """
+        Extract bounding box from binary mask in XYXY format.
+
+        Args:
+            mask: Binary mask array (H, W)
+
+        Returns:
+            Bounding box as [x1, y1, x2, y2] in pixel coordinates,
+            or [0, 0, 0, 0] if mask is empty
+        """
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+
+        if not rows.any() or not cols.any():
+            return [0.0, 0.0, 0.0, 0.0]
+
+        y1, y2 = np.where(rows)[0][[0, -1]]
+        x1, x2 = np.where(cols)[0][[0, -1]]
+
+        return [float(x1), float(y1), float(x2), float(y2)]
+
+    def _mask_to_centroid(self, mask: np.ndarray) -> List[float]:
+        """
+        Compute centroid (center of mass) of binary mask.
+
+        Args:
+            mask: Binary mask array (H, W)
+
+        Returns:
+            Centroid as [cx, cy] in pixel coordinates,
+            or center of image if mask is empty
+        """
+        if not mask.any():
+            h, w = mask.shape
+            return [float(w / 2), float(h / 2)]
+
+        # Compute center of mass
+        rows, cols = np.where(mask)
+        cy = float(np.mean(rows))
+        cx = float(np.mean(cols))
+
+        return [cx, cy]
+
+    def _normalize_bbox(
+        self, bbox: List[float], img_height: int, img_width: int
+    ) -> List[float]:
+        """
+        Normalize bounding box coordinates to 0-1 range.
+
+        Args:
+            bbox: Bounding box as [x1, y1, x2, y2] in pixel coordinates
+            img_height: Image height in pixels
+            img_width: Image width in pixels
+
+        Returns:
+            Normalized bounding box as [x1, y1, x2, y2] in 0-1 range
+        """
+        x1, y1, x2, y2 = bbox
+        return [
+            x1 / img_width,
+            y1 / img_height,
+            x2 / img_width,
+            y2 / img_height,
+        ]
+
+    def _init_video_state(self, frames_dir: Path) -> dict:
+        """
+        Initialize SAM-2 video predictor state with frame directory.
+
+        Uses directory path for memory efficiency (SAM-2 loads frames on-demand).
+
+        Args:
+            frames_dir: Directory containing video frames (*.jpg or *.png)
+
+        Returns:
+            SAM-2 inference state dictionary
+
+        Raises:
+            RuntimeError: If video predictor not loaded or initialization fails
+        """
+        if self.video_predictor is None:
+            raise RuntimeError(
+                "[SEG-ERR-013] Video predictor not initialized. "
+                "Call _load_video_predictor() first."
+            )
+
+        logger.info(f"Initializing video state from {frames_dir}")
+        start_time = time.perf_counter()
+
+        try:
+            # Use directory path - SAM-2 loads frames on demand
+            inference_state = self.video_predictor.init_state(
+                video_path=str(frames_dir),
+                offload_video_to_cpu=self.config.get("offload_video_to_cpu", False),
+                offload_state_to_cpu=self.config.get("offload_state_to_cpu", False),
+            )
+
+            init_time = time.perf_counter() - start_time
+            self.metrics["video_state_init_time_seconds"] = init_time
+            logger.info(f"Video state initialized in {init_time:.2f}s")
+
+            return inference_state
+
+        except Exception as e:
+            raise RuntimeError(
+                f"[SEG-ERR-014] Failed to initialize video state.\n"
+                f"Frames directory: {frames_dir}\n"
+                f"Error: {e}"
+            ) from e
+
+    def _add_object_prompts(
+        self, inference_state: dict, detections: List[dict]
+    ) -> dict:
+        """
+        Add bounding box prompts from keyframe detections to video state.
+
+        Converts Phase 2 mask detections to bounding box prompts for SAM-2
+        video tracking. Each detection becomes a tracked object.
+
+        Args:
+            inference_state: SAM-2 video inference state from _init_video_state()
+            detections: List of detection dicts from Phase 2 keyframe segmentation
+                Each dict has: mask, bbox (XYWH), area, confidence, frame_idx
+
+        Returns:
+            Dictionary mapping object_id to detection info for reference
+        """
+        logger.info(f"Adding {len(detections)} object prompts from keyframes")
+
+        object_info = {}
+
+        for obj_id, detection in enumerate(detections):
+            frame_idx = detection["frame_idx"]
+            mask = detection["mask"]
+            img_height, img_width = mask.shape
+
+            # Convert bbox from XYWH to XYXY format
+            x, y, w, h = detection["bbox"]
+            bbox_xyxy = [x, y, x + w, y + h]
+
+            # Normalize to 0-1 range for SAM-2
+            bbox_normalized = self._normalize_bbox(bbox_xyxy, img_height, img_width)
+
+            try:
+                # Add bounding box prompt to video predictor
+                _, out_obj_ids, out_masks = self.video_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    box=np.array(bbox_normalized),
+                    normalize_coords=True,
+                )
+
+                object_info[obj_id] = {
+                    "source_frame": frame_idx,
+                    "source_confidence": detection["confidence"],
+                    "source_bbox": detection["bbox"],
+                }
+
+                logger.debug(
+                    f"Added prompt for object {obj_id} at frame {frame_idx} "
+                    f"with bbox {bbox_normalized}"
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"[SEG-ERR-015] Failed to add prompt for object {obj_id} "
+                    f"at frame {frame_idx}: {e}"
+                )
+                raise
+
+        logger.info(f"Successfully added {len(object_info)} object prompts")
+        return object_info
+
+    def _propagate_masks(
+        self,
+        inference_state: dict,
+        num_frames: int,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+    ) -> dict:
+        """
+        Propagate masks through all video frames using SAM-2 video tracking.
+
+        Iterates through the SAM-2 propagation generator, collecting masks
+        and computing per-frame metadata (bbox, centroid, area) for Stage 4.
+
+        Args:
+            inference_state: SAM-2 video inference state with prompts added
+            num_frames: Total number of frames in video
+            progress_callback: Optional callback(progress, message)
+
+        Returns:
+            Dictionary mapping frame_idx -> list of object data dicts:
+                [{object_id, mask, bbox, centroid, area}, ...]
+        """
+        logger.info(f"Propagating masks through {num_frames} frames")
+        start_time = time.perf_counter()
+
+        all_masks = {}
+        frames_processed = 0
+
+        try:
+            for frame_idx, obj_ids, mask_logits in self.video_predictor.propagate_in_video(
+                inference_state=inference_state,
+            ):
+                frames_processed += 1
+
+                if progress_callback:
+                    progress = frames_processed / num_frames
+                    progress_callback(
+                        progress, f"Tracking frame {frames_processed}/{num_frames}"
+                    )
+
+                frame_data = []
+
+                # Process each object's mask for this frame
+                for i, obj_id in enumerate(obj_ids):
+                    # Convert logits to binary mask
+                    # mask_logits shape: (num_objects, H, W) or (1, H, W) per object
+                    mask = (mask_logits[i] > 0.0).cpu().numpy()
+
+                    # Skip empty masks (object not visible in this frame)
+                    if not mask.any():
+                        continue
+
+                    # Compute per-frame metadata for Stage 4
+                    bbox = self._mask_to_bbox(mask)
+                    centroid = self._mask_to_centroid(mask)
+                    area = int(mask.sum())
+
+                    frame_data.append({
+                        "object_id": int(obj_id),
+                        "mask": mask,
+                        "bbox": bbox,
+                        "centroid": centroid,
+                        "area": area,
+                    })
+
+                if frame_data:
+                    all_masks[frame_idx] = frame_data
+
+            propagate_time = time.perf_counter() - start_time
+            self.metrics["propagation_time_seconds"] = propagate_time
+            self.metrics["frames_tracked"] = frames_processed
+
+            fps = frames_processed / propagate_time if propagate_time > 0 else 0
+            logger.info(
+                f"Propagation complete: {frames_processed} frames in {propagate_time:.2f}s "
+                f"({fps:.1f} fps)"
+            )
+
+            return all_masks
+
+        except Exception as e:
+            raise RuntimeError(
+                f"[SEG-ERR-016] Mask propagation failed at frame {frames_processed}.\n"
+                f"Error: {e}"
+            ) from e
+
+    def _validate_tracking_quality(self, all_masks: dict) -> dict:
+        """
+        Validate tracking quality by computing temporal IoU between adjacent frames.
+
+        Emits warnings (not errors) for quality issues to allow pipeline to continue.
+
+        Args:
+            all_masks: Dictionary from _propagate_masks() mapping frame_idx -> object data
+
+        Returns:
+            Quality metrics dictionary with mean_iou, min_iou, warnings
+        """
+        logger.info("Validating tracking quality")
+
+        quality_metrics = {
+            "mean_iou": 0.0,
+            "min_iou": 1.0,
+            "per_object_iou": {},
+            "warnings": [],
+        }
+
+        if len(all_masks) < 2:
+            logger.warning("[SEG-WARN-010] Not enough frames for quality validation")
+            return quality_metrics
+
+        # Group masks by object ID across frames
+        object_tracks = {}  # obj_id -> [(frame_idx, mask), ...]
+        for frame_idx, frame_data in all_masks.items():
+            for obj_info in frame_data:
+                obj_id = obj_info["object_id"]
+                if obj_id not in object_tracks:
+                    object_tracks[obj_id] = []
+                object_tracks[obj_id].append((frame_idx, obj_info["mask"]))
+
+        all_ious = []
+
+        for obj_id, track in object_tracks.items():
+            if len(track) < 2:
+                continue
+
+            # Sort by frame index
+            track.sort(key=lambda x: x[0])
+            object_ious = []
+
+            # Compute IoU between adjacent frames
+            for i in range(len(track) - 1):
+                frame1, mask1 = track[i]
+                frame2, mask2 = track[i + 1]
+
+                # Only compute for truly adjacent frames
+                if frame2 - frame1 == 1:
+                    iou = self._compute_mask_iou(mask1, mask2)
+                    object_ious.append(iou)
+                    all_ious.append(iou)
+
+                    # Emit warning for low IoU
+                    if iou < 0.7:
+                        warning = (
+                            f"Object {obj_id}: low IoU ({iou:.2f}) "
+                            f"between frames {frame1}-{frame2}"
+                        )
+                        quality_metrics["warnings"].append(warning)
+                        logger.warning(f"[SEG-WARN-011] {warning}")
+
+            if object_ious:
+                quality_metrics["per_object_iou"][obj_id] = {
+                    "mean": float(np.mean(object_ious)),
+                    "min": float(np.min(object_ious)),
+                    "max": float(np.max(object_ious)),
+                }
+
+        if all_ious:
+            quality_metrics["mean_iou"] = float(np.mean(all_ious))
+            quality_metrics["min_iou"] = float(np.min(all_ious))
+
+        # Log summary
+        if quality_metrics["warnings"]:
+            logger.warning(
+                f"[SEG-WARN-012] Quality validation found {len(quality_metrics['warnings'])} "
+                f"warnings. Pipeline will continue."
+            )
+        else:
+            logger.info("Quality validation passed - no warnings")
+
+        logger.info(
+            f"Quality metrics: mean_iou={quality_metrics['mean_iou']:.3f}, "
+            f"min_iou={quality_metrics['min_iou']:.3f}"
+        )
+
+        return quality_metrics
+
+    def _export_tracks(
+        self,
+        all_masks: dict,
+        output_dir: Path,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+    ) -> tuple:
+        """
+        Export tracked masks to disk and generate enhanced metadata.
+
+        Creates directory structure: masks/{object_id}/{frame_idx:04d}.png
+        Generates enhanced metadata with per-frame bbox, centroid, area for Stage 4.
+
+        Args:
+            all_masks: Dictionary from _propagate_masks()
+            output_dir: Base output directory
+            progress_callback: Optional callback(progress, message)
+
+        Returns:
+            Tuple of (List[SegmentedObject], enhanced_metadata_dict)
+        """
+        logger.info(f"Exporting tracks to {output_dir}")
+        start_time = time.perf_counter()
+
+        masks_dir = output_dir / "masks"
+        masks_dir.mkdir(parents=True, exist_ok=True)
+
+        # Reorganize by object ID
+        object_data = {}  # obj_id -> {frames: [], per_frame_data: {}}
+        frame_to_objects = {}  # frame_idx -> [obj_ids]
+
+        total_masks = sum(len(frame_data) for frame_data in all_masks.values())
+        masks_saved = 0
+
+        for frame_idx, frame_data in all_masks.items():
+            frame_to_objects[frame_idx] = []
+
+            for obj_info in frame_data:
+                obj_id = obj_info["object_id"]
+                frame_to_objects[frame_idx].append(obj_id)
+
+                if obj_id not in object_data:
+                    object_data[obj_id] = {
+                        "frames": [],
+                        "per_frame_data": {},
+                        "mask_paths": [],
+                    }
+
+                # Track frame data
+                object_data[obj_id]["frames"].append(frame_idx)
+                object_data[obj_id]["per_frame_data"][str(frame_idx)] = {
+                    "bbox": obj_info["bbox"],
+                    "centroid": obj_info["centroid"],
+                    "area": obj_info["area"],
+                }
+
+                # Save mask PNG
+                obj_dir = masks_dir / str(obj_id)
+                obj_dir.mkdir(exist_ok=True)
+                mask_filename = f"{frame_idx:04d}.png"
+                mask_path = obj_dir / mask_filename
+
+                self._save_mask(obj_info["mask"], mask_path)
+                object_data[obj_id]["mask_paths"].append(str(mask_path))
+
+                masks_saved += 1
+                if progress_callback and masks_saved % 50 == 0:
+                    progress = masks_saved / total_masks
+                    progress_callback(progress, f"Saving masks ({masks_saved}/{total_masks})")
+
+        # Build SegmentedObject list
+        segmented_objects = []
+        for obj_id in sorted(object_data.keys()):
+            data = object_data[obj_id]
+            # Sort frames for consistency
+            sorted_frames = sorted(data["frames"])
+
+            obj = SegmentedObject(
+                object_id=obj_id,
+                label=None,  # No semantic labels in MVP
+                mask_paths=data["mask_paths"],
+                frame_indices=sorted_frames,
+                confidence=1.0,  # Could compute from tracking quality
+            )
+            segmented_objects.append(obj)
+
+        # Build enhanced metadata for Stage 4
+        enhanced_metadata = {
+            "num_frames": len(all_masks),
+            "frame_to_objects": {
+                str(k): v for k, v in frame_to_objects.items()
+            },
+            "per_object_frame_data": {
+                str(obj_id): data["per_frame_data"]
+                for obj_id, data in object_data.items()
+            },
+        }
+
+        export_time = time.perf_counter() - start_time
+        self.metrics["export_time_seconds"] = export_time
+        self.metrics["masks_saved"] = masks_saved
+
+        logger.info(
+            f"Exported {len(segmented_objects)} objects, {masks_saved} masks "
+            f"in {export_time:.2f}s"
+        )
+
+        return segmented_objects, enhanced_metadata
+
+    def _save_mask(self, mask: np.ndarray, path: Path) -> None:
+        """
+        Save binary mask as 8-bit grayscale PNG.
+
+        Args:
+            mask: Binary mask array (H, W) with dtype bool or 0/1 values
+            path: Output path for PNG file
+        """
+        # Convert to 8-bit (0 = background, 255 = object)
+        mask_uint8 = (mask.astype(np.uint8) * 255)
+        img = Image.fromarray(mask_uint8, mode="L")
+        img.save(path, compress_level=6)
+
+    def _save_enhanced_metadata(
+        self,
+        objects: List[SegmentedObject],
+        metadata_path: Path,
+        quality_metrics: dict,
+        enhanced_metadata: dict,
+    ) -> dict:
+        """
+        Save enhanced metadata JSON for Stage 4 compatibility.
+
+        Includes per-frame spatial data (bbox, centroid, area) and
+        frame-to-objects mapping for efficient spatial queries.
+
+        Args:
+            objects: List of SegmentedObject
+            metadata_path: Path to save JSON file
+            quality_metrics: Quality metrics from _validate_tracking_quality()
+            enhanced_metadata: Enhanced metadata from _export_tracks()
+
+        Returns:
+            Complete metadata dictionary
+        """
+        metadata = {
+            "num_objects": len(objects),
+            "num_frames": enhanced_metadata.get("num_frames", 0),
+            "objects": [
+                {
+                    "object_id": obj.object_id,
+                    "label": obj.label,
+                    "num_frames": len(obj.frame_indices),
+                    "frame_indices": obj.frame_indices,
+                    "confidence": obj.confidence,
+                    "per_frame_data": enhanced_metadata.get("per_object_frame_data", {}).get(
+                        str(obj.object_id), {}
+                    ),
+                }
+                for obj in objects
+            ],
+            "frame_to_objects": enhanced_metadata.get("frame_to_objects", {}),
+            "quality_metrics": quality_metrics,
+            "metrics": self.metrics,
+        }
+
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"Saved enhanced metadata to {metadata_path}")
+        return metadata
+
     def _track_objects(
         self,
         frame_files: List[Path],
         initial_detections: List[dict],
         output_dir: Path,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> List[SegmentedObject]:
         """
         Track objects across all frames using SAM-2 video predictor.
 
-        SAM-2's video tracking propagates masks forward and backward in time,
-        maintaining consistent object identities.
+        SAM-2's video tracking propagates masks forward from keyframe prompts,
+        maintaining consistent object identities throughout the video.
+
+        Process:
+        1. Initialize video state with frame directory
+        2. Add bounding box prompts from keyframe detections
+        3. Propagate masks through all frames
+        4. Validate tracking quality (emit warnings, not errors)
+        5. Export masks to disk with enhanced metadata
 
         Args:
             frame_files: List of all frame file paths
             initial_detections: List of detection dicts from Phase 2 keyframe segmentation
                 Each dict has: mask, bbox, area, confidence, frame_idx
             output_dir: Directory to save mask PNGs
+            progress_callback: Optional callback(progress, message)
 
         Returns:
             List of SegmentedObject with mask_paths and frame_indices populated
 
-        Note: This is a Phase 3 implementation - currently raises NotImplementedError.
+        Raises:
+            RuntimeError: If tracking fails critically
         """
-        # TODO: Implement in Phase 3
-        # 1. Initialize SAM-2 video predictor with video frames
-        # 2. For each detection in initial_detections:
-        #    - Add mask prompt at the detection's frame_idx
-        # 3. Propagate masks forward and backward through video
-        # 4. Save masks to output_dir/{object_id}/{frame_idx:04d}.png
-        # 5. Return List[SegmentedObject] with mask_paths and frame_indices
-        raise NotImplementedError(
-            "Object tracking not yet implemented (Phase 3)"
+        logger.info(
+            f"Starting object tracking: {len(initial_detections)} objects, "
+            f"{len(frame_files)} frames"
         )
+        start_time = time.perf_counter()
+
+        # Get frames directory from first frame file
+        frames_dir = frame_files[0].parent
+        num_frames = len(frame_files)
+
+        def report(pct: float, msg: str):
+            if progress_callback:
+                progress_callback(pct, msg)
+            logger.debug(f"[{pct*100:.0f}%] {msg}")
+
+        try:
+            # Step 1: Initialize video state
+            report(0.0, "Initializing video state")
+            inference_state = self._init_video_state(frames_dir)
+
+            # Step 2: Add object prompts from keyframe detections
+            report(0.1, "Adding object prompts from keyframes")
+            object_info = self._add_object_prompts(inference_state, initial_detections)
+
+            # Warn about memory usage for long videos
+            if num_frames > 500:
+                # Get frame dimensions from first frame
+                first_frame = Image.open(frame_files[0])
+                img_width, img_height = first_frame.size
+                first_frame.close()
+
+                # Estimate: each mask is H*W bytes (bool array), one per object per frame
+                num_objects = len(initial_detections)
+                estimated_gb = (num_frames * num_objects * img_height * img_width) / (1024 ** 3)
+                if estimated_gb > 4.0:
+                    logger.warning(
+                        f"[SEG-WARN-014] Long video detected: {num_frames} frames with "
+                        f"{num_objects} objects may require ~{estimated_gb:.1f}GB RAM "
+                        f"for mask storage. Consider reducing frame count or video resolution."
+                    )
+
+            # Step 3: Propagate masks through video
+            report(0.15, "Propagating masks through video")
+            all_masks = self._propagate_masks(
+                inference_state,
+                num_frames,
+                lambda p, m: report(0.15 + p * 0.55, m),
+            )
+
+            # Handle case where no masks were propagated
+            if not all_masks:
+                logger.warning("[SEG-WARN-013] No masks propagated - objects may not be visible")
+                return []
+
+            # Step 4: Validate tracking quality
+            report(0.70, "Validating tracking quality")
+            quality_metrics = self._validate_tracking_quality(all_masks)
+
+            # Step 5: Export masks and generate enhanced metadata
+            report(0.75, "Exporting masks to disk")
+            segmented_objects, enhanced_metadata = self._export_tracks(
+                all_masks,
+                output_dir,
+                lambda p, m: report(0.75 + p * 0.20, m),
+            )
+
+            # Step 6: Save enhanced metadata
+            report(0.95, "Saving metadata")
+            metadata_path = output_dir / "object_metadata.json"
+            self._save_enhanced_metadata(
+                segmented_objects,
+                metadata_path,
+                quality_metrics,
+                enhanced_metadata,
+            )
+
+            # Record total tracking time
+            total_time = time.perf_counter() - start_time
+            self.metrics["total_tracking_time_seconds"] = total_time
+
+            report(1.0, f"Tracking complete: {len(segmented_objects)} objects")
+            logger.info(
+                f"Object tracking complete: {len(segmented_objects)} objects "
+                f"tracked in {total_time:.2f}s"
+            )
+
+            return segmented_objects
+
+        except Exception as e:
+            logger.error(f"[SEG-ERR-017] Object tracking failed: {e}")
+            raise RuntimeError(
+                f"[SEG-ERR-017] Object tracking failed.\n"
+                f"Frames directory: {frames_dir}\n"
+                f"Initial detections: {len(initial_detections)}\n"
+                f"Error: {e}"
+            ) from e
 
     def _save_metadata(
         self, objects: List[SegmentedObject], metadata_path: Path
