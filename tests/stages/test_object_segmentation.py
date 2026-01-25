@@ -1,12 +1,18 @@
-"""Unit tests for Phase 2: Keyframe Segmentation."""
+"""Unit tests for Object Segmentation Stage (Phase 2 & 3)."""
 
 import json
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import numpy as np
 import pytest
+
+# Mock torch before importing the module to avoid dependency
+mock_torch = MagicMock()
+mock_torch.cuda.is_available.return_value = False
+sys.modules["torch"] = mock_torch
 
 from backend.stages.object_segmentation import (
     ObjectSegmentationStage,
@@ -496,3 +502,420 @@ class TestContextManager:
         # After exiting context, models should be cleaned up
         assert stage.image_model is None
         assert stage.video_predictor is None
+
+
+# ============================================================================
+# Phase 3: Video Object Tracking Tests
+# ============================================================================
+
+
+class TestMaskToBbox:
+    """Tests for _mask_to_bbox helper method."""
+
+    def test_simple_mask(self, stage_config):
+        """Extract bbox from simple rectangular mask."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[20:40, 30:60] = True  # Rectangle from (30,20) to (60,40)
+
+        bbox = stage._mask_to_bbox(mask)
+
+        assert bbox == [30.0, 20.0, 59.0, 39.0]  # x1, y1, x2, y2
+
+    def test_empty_mask(self, stage_config):
+        """Empty mask returns zeros."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.zeros((100, 100), dtype=bool)
+        bbox = stage._mask_to_bbox(mask)
+
+        assert bbox == [0.0, 0.0, 0.0, 0.0]
+
+    def test_full_mask(self, stage_config):
+        """Full mask returns image dimensions."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.ones((50, 80), dtype=bool)
+        bbox = stage._mask_to_bbox(mask)
+
+        assert bbox == [0.0, 0.0, 79.0, 49.0]
+
+
+class TestMaskToCentroid:
+    """Tests for _mask_to_centroid helper method."""
+
+    def test_centered_mask(self, stage_config):
+        """Centered mask returns center of image."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[40:60, 40:60] = True  # 20x20 box centered at (50, 50)
+
+        centroid = stage._mask_to_centroid(mask)
+
+        # Center of the masked region
+        assert centroid[0] == pytest.approx(49.5, rel=0.1)
+        assert centroid[1] == pytest.approx(49.5, rel=0.1)
+
+    def test_corner_mask(self, stage_config):
+        """Corner mask returns corner centroid."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[0:10, 0:10] = True  # Top-left corner
+
+        centroid = stage._mask_to_centroid(mask)
+
+        assert centroid[0] == pytest.approx(4.5, rel=0.1)
+        assert centroid[1] == pytest.approx(4.5, rel=0.1)
+
+    def test_empty_mask(self, stage_config):
+        """Empty mask returns image center."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.zeros((100, 80), dtype=bool)
+        centroid = stage._mask_to_centroid(mask)
+
+        # Returns center of image for empty mask
+        assert centroid == [40.0, 50.0]
+
+
+class TestNormalizeBbox:
+    """Tests for _normalize_bbox helper method."""
+
+    def test_normalize_full_image(self, stage_config):
+        """Bbox covering full image normalizes to [0,0,1,1]."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        bbox = [0.0, 0.0, 100.0, 50.0]
+        normalized = stage._normalize_bbox(bbox, img_height=50, img_width=100)
+
+        assert normalized == [0.0, 0.0, 1.0, 1.0]
+
+    def test_normalize_centered_box(self, stage_config):
+        """Centered box normalizes correctly."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        bbox = [25.0, 12.5, 75.0, 37.5]  # Centered in 100x50 image
+        normalized = stage._normalize_bbox(bbox, img_height=50, img_width=100)
+
+        assert normalized == [0.25, 0.25, 0.75, 0.75]
+
+
+class TestInitVideoState:
+    """Tests for _init_video_state method."""
+
+    def test_calls_init_state_with_directory_path(self, stage_config, temp_frames_dir):
+        """Verify init_state receives directory path, not numpy arrays."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        # Mock video predictor
+        mock_predictor = MagicMock()
+        mock_predictor.init_state.return_value = {"test": "state"}
+        stage.video_predictor = mock_predictor
+
+        result = stage._init_video_state(temp_frames_dir)
+
+        # Verify called with string path
+        mock_predictor.init_state.assert_called_once()
+        call_args = mock_predictor.init_state.call_args
+        assert call_args.kwargs["video_path"] == str(temp_frames_dir)
+
+        assert result == {"test": "state"}
+
+    def test_raises_if_predictor_not_loaded(self, stage_config, temp_frames_dir):
+        """Raises RuntimeError if video predictor not initialized."""
+        stage = ObjectSegmentationStage(stage_config)
+        stage.video_predictor = None
+
+        with pytest.raises(RuntimeError, match="SEG-ERR-013"):
+            stage._init_video_state(temp_frames_dir)
+
+
+class TestAddObjectPrompts:
+    """Tests for _add_object_prompts method."""
+
+    def test_converts_bbox_to_xyxy_normalized(self, stage_config):
+        """Verify bbox converted from XYWH to XYXY normalized."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mock_predictor = MagicMock()
+        mock_predictor.add_new_points_or_box.return_value = (0, [0], np.ones((1, 10, 10)))
+        stage.video_predictor = mock_predictor
+
+        # Detection with XYWH bbox
+        detections = [{
+            "mask": np.ones((100, 100), dtype=bool),
+            "bbox": [25, 25, 50, 50],  # XYWH: x=25, y=25, w=50, h=50
+            "confidence": 0.9,
+            "frame_idx": 0,
+        }]
+
+        inference_state = {"test": "state"}
+        stage._add_object_prompts(inference_state, detections)
+
+        # Verify call
+        call_args = mock_predictor.add_new_points_or_box.call_args
+        box_arg = call_args.kwargs["box"]
+
+        # Should be normalized XYXY: [0.25, 0.25, 0.75, 0.75]
+        expected = np.array([0.25, 0.25, 0.75, 0.75])
+        np.testing.assert_array_almost_equal(box_arg, expected)
+
+    def test_assigns_sequential_object_ids(self, stage_config):
+        """Verify object IDs are sequential starting from 0."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mock_predictor = MagicMock()
+        mock_predictor.add_new_points_or_box.return_value = (0, [0], np.ones((1, 10, 10)))
+        stage.video_predictor = mock_predictor
+
+        detections = [
+            {"mask": np.ones((100, 100), dtype=bool), "bbox": [0, 0, 10, 10], "confidence": 0.9, "frame_idx": 0},
+            {"mask": np.ones((100, 100), dtype=bool), "bbox": [0, 0, 10, 10], "confidence": 0.8, "frame_idx": 5},
+            {"mask": np.ones((100, 100), dtype=bool), "bbox": [0, 0, 10, 10], "confidence": 0.7, "frame_idx": 10},
+        ]
+
+        inference_state = {"test": "state"}
+        result = stage._add_object_prompts(inference_state, detections)
+
+        # Should have been called 3 times with obj_id 0, 1, 2
+        assert mock_predictor.add_new_points_or_box.call_count == 3
+
+        calls = mock_predictor.add_new_points_or_box.call_args_list
+        assert calls[0].kwargs["obj_id"] == 0
+        assert calls[1].kwargs["obj_id"] == 1
+        assert calls[2].kwargs["obj_id"] == 2
+
+
+class TestPropagateMasks:
+    """Tests for _propagate_masks method."""
+
+    def test_iterates_generator_correctly(self, stage_config):
+        """Verify generator consumption and mask processing."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        # Create mock generator that yields 3 frames
+        def mock_generator(inference_state):
+            for frame_idx in range(3):
+                obj_ids = [0, 1]
+                # Mock mask logits as tensor-like
+                mask_logits = MagicMock()
+                mask_logits.__getitem__ = lambda self, i: MagicMock(
+                    __gt__=lambda self, v: MagicMock(
+                        cpu=lambda: MagicMock(
+                            numpy=lambda: np.ones((50, 50), dtype=bool)
+                        )
+                    )
+                )
+                yield frame_idx, obj_ids, mask_logits
+
+        mock_predictor = MagicMock()
+        mock_predictor.propagate_in_video.return_value = mock_generator({})
+        stage.video_predictor = mock_predictor
+
+        result = stage._propagate_masks({}, num_frames=3)
+
+        # Should have 3 frames
+        assert len(result) == 3
+        assert 0 in result
+        assert 1 in result
+        assert 2 in result
+
+    def test_computes_per_frame_metadata(self, stage_config):
+        """Verify bbox, centroid, area computed for each frame."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        # Create a simple mask
+        test_mask = np.zeros((100, 100), dtype=bool)
+        test_mask[20:40, 30:60] = True
+
+        def mock_generator(inference_state):
+            obj_ids = [0]
+            mask_logits = MagicMock()
+            mask_logits.__getitem__ = lambda self, i: MagicMock(
+                __gt__=lambda self, v: MagicMock(
+                    cpu=lambda: MagicMock(numpy=lambda: test_mask)
+                )
+            )
+            yield 0, obj_ids, mask_logits
+
+        mock_predictor = MagicMock()
+        mock_predictor.propagate_in_video.return_value = mock_generator({})
+        stage.video_predictor = mock_predictor
+
+        result = stage._propagate_masks({}, num_frames=1)
+
+        # Check metadata was computed
+        frame_data = result[0][0]
+        assert "bbox" in frame_data
+        assert "centroid" in frame_data
+        assert "area" in frame_data
+        assert frame_data["area"] == test_mask.sum()
+
+
+class TestValidateTrackingQuality:
+    """Tests for _validate_tracking_quality method."""
+
+    def test_perfect_overlap_high_iou(self, stage_config):
+        """Perfect overlap between frames gives IoU of 1.0."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.ones((50, 50), dtype=bool)
+        all_masks = {
+            0: [{"object_id": 0, "mask": mask}],
+            1: [{"object_id": 0, "mask": mask}],
+        }
+
+        quality = stage._validate_tracking_quality(all_masks)
+
+        assert quality["mean_iou"] == 1.0
+        assert quality["min_iou"] == 1.0
+        assert len(quality["warnings"]) == 0
+
+    def test_low_iou_generates_warning(self, stage_config):
+        """Low IoU between frames generates warning."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask1 = np.zeros((100, 100), dtype=bool)
+        mask1[0:30, 0:30] = True
+
+        mask2 = np.zeros((100, 100), dtype=bool)
+        mask2[70:100, 70:100] = True  # No overlap
+
+        all_masks = {
+            0: [{"object_id": 0, "mask": mask1}],
+            1: [{"object_id": 0, "mask": mask2}],
+        }
+
+        quality = stage._validate_tracking_quality(all_masks)
+
+        assert quality["mean_iou"] < 0.7
+        assert len(quality["warnings"]) > 0
+        assert "low IoU" in quality["warnings"][0]
+
+
+class TestExportTracks:
+    """Tests for _export_tracks method."""
+
+    def test_creates_directory_structure(self, stage_config, temp_output_dir):
+        """Verify masks/{object_id}/ directories created."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.ones((50, 50), dtype=bool)
+        all_masks = {
+            0: [
+                {"object_id": 0, "mask": mask, "bbox": [0, 0, 50, 50], "centroid": [25, 25], "area": 2500},
+                {"object_id": 1, "mask": mask, "bbox": [0, 0, 50, 50], "centroid": [25, 25], "area": 2500},
+            ],
+        }
+
+        objects, metadata = stage._export_tracks(all_masks, temp_output_dir)
+
+        # Check directories created
+        masks_dir = temp_output_dir / "masks"
+        assert masks_dir.exists()
+        assert (masks_dir / "0").exists()
+        assert (masks_dir / "1").exists()
+
+    def test_saves_binary_png_masks(self, stage_config, temp_output_dir):
+        """Verify masks saved as 0/255 PNG files."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.zeros((50, 50), dtype=bool)
+        mask[10:40, 10:40] = True
+
+        all_masks = {
+            0: [{"object_id": 0, "mask": mask, "bbox": [10, 10, 40, 40], "centroid": [25, 25], "area": 900}],
+        }
+
+        stage._export_tracks(all_masks, temp_output_dir)
+
+        # Load saved mask and verify
+        from PIL import Image
+
+        mask_path = temp_output_dir / "masks" / "0" / "0000.png"
+        assert mask_path.exists()
+
+        loaded = np.array(Image.open(mask_path))
+        assert loaded.dtype == np.uint8
+        assert loaded.max() == 255
+        assert loaded.min() == 0
+
+    def test_generates_enhanced_metadata(self, stage_config, temp_output_dir):
+        """Verify per_frame_data and frame_to_objects included."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        mask = np.ones((50, 50), dtype=bool)
+        all_masks = {
+            0: [{"object_id": 0, "mask": mask, "bbox": [0, 0, 50, 50], "centroid": [25, 25], "area": 2500}],
+            1: [{"object_id": 0, "mask": mask, "bbox": [0, 0, 50, 50], "centroid": [25, 25], "area": 2500}],
+        }
+
+        objects, enhanced_metadata = stage._export_tracks(all_masks, temp_output_dir)
+
+        # Check enhanced metadata structure
+        assert "frame_to_objects" in enhanced_metadata
+        assert "per_object_frame_data" in enhanced_metadata
+        assert "0" in enhanced_metadata["frame_to_objects"]
+        assert "0" in enhanced_metadata["per_object_frame_data"]
+
+
+class TestTrackObjectsOrchestration:
+    """Tests for _track_objects main orchestration method."""
+
+    def test_full_pipeline_with_mock(self, stage_config, temp_frames_dir, temp_output_dir):
+        """Integration test with mocked video predictor."""
+        stage = ObjectSegmentationStage(stage_config)
+
+        # Setup mock video predictor
+        mock_predictor = MagicMock()
+        mock_predictor.init_state.return_value = {"test": "state"}
+        mock_predictor.add_new_points_or_box.return_value = (0, [0], np.ones((1, 50, 50)))
+
+        # Create mask data
+        test_mask = np.ones((50, 50), dtype=bool)
+
+        def mock_generator(inference_state):
+            for frame_idx in range(3):
+                mask_logits = MagicMock()
+                mask_logits.__getitem__ = lambda self, i: MagicMock(
+                    __gt__=lambda self, v: MagicMock(
+                        cpu=lambda: MagicMock(numpy=lambda: test_mask)
+                    )
+                )
+                yield frame_idx, [0], mask_logits
+
+        mock_predictor.propagate_in_video.return_value = mock_generator({})
+        stage.video_predictor = mock_predictor
+
+        # Create frame files
+        frame_files = sorted(temp_frames_dir.glob("*.jpg"))[:5]
+
+        # Create detection
+        initial_detections = [{
+            "mask": np.ones((50, 50), dtype=bool),
+            "bbox": [0, 0, 50, 50],
+            "confidence": 0.9,
+            "frame_idx": 0,
+        }]
+
+        # Run tracking
+        result = stage._track_objects(frame_files, initial_detections, temp_output_dir)
+
+        # Verify result
+        assert len(result) == 1
+        assert result[0].object_id == 0
+        assert len(result[0].frame_indices) == 3
+
+        # Verify metadata saved
+        metadata_path = temp_output_dir / "object_metadata.json"
+        assert metadata_path.exists()
+
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+
+        assert metadata["num_objects"] == 1
+        assert "frame_to_objects" in metadata
+        assert "quality_metrics" in metadata
