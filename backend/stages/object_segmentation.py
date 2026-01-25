@@ -1237,8 +1237,8 @@ class ObjectSegmentationStage:
                     # Process each object's mask for this frame
                     for i, obj_id in enumerate(obj_ids):
                         # Convert logits to binary mask
-                        # mask_logits shape: (num_objects, H, W) or (1, H, W) per object
-                        mask = (mask_logits[i] > 0.0).cpu().numpy()
+                        # mask_logits shape: (num_objects, 1, H, W); squeeze to (H, W)
+                        mask = (mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
                         # Skip empty masks (object not visible in this frame)
                         if not mask.any():
