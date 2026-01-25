@@ -1561,6 +1561,23 @@ class ObjectSegmentationStage:
             report(0.1, "Adding object prompts from keyframes")
             object_info = self._add_object_prompts(inference_state, initial_detections)
 
+            # Warn about memory usage for long videos
+            if num_frames > 500:
+                # Get frame dimensions from first frame
+                first_frame = Image.open(frame_files[0])
+                img_width, img_height = first_frame.size
+                first_frame.close()
+
+                # Estimate: each mask is H*W bytes (bool array), one per object per frame
+                num_objects = len(initial_detections)
+                estimated_gb = (num_frames * num_objects * img_height * img_width) / (1024 ** 3)
+                if estimated_gb > 4.0:
+                    logger.warning(
+                        f"[SEG-WARN-014] Long video detected: {num_frames} frames with "
+                        f"{num_objects} objects may require ~{estimated_gb:.1f}GB RAM "
+                        f"for mask storage. Consider reducing frame count or video resolution."
+                    )
+
             # Step 3: Propagate masks through video
             report(0.15, "Propagating masks through video")
             all_masks = self._propagate_masks(
