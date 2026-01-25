@@ -313,7 +313,14 @@ class ObjectSegmentationStage:
                         if block_num % 500 == 0:
                             logger.info(f"Download progress: {percent:.1f}%")
 
-                urllib.request.urlretrieve(url, temp_path, reporthook=report_progress)
+                # Set socket timeout to prevent indefinite hangs on slow/stalled connections
+                import socket
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(300)  # 5 minutes for large model files
+                try:
+                    urllib.request.urlretrieve(url, temp_path, reporthook=report_progress)
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
 
                 # Verify checksum if available
                 if expected_sha256:
@@ -1498,7 +1505,7 @@ class ObjectSegmentationStage:
             "metrics": self.metrics,
         }
 
-        with open(metadata_path, "w") as f:
+        with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
         logger.info(f"Saved enhanced metadata to {metadata_path}")
@@ -1653,7 +1660,7 @@ class ObjectSegmentationStage:
             "metrics": self.metrics,
         }
 
-        with open(metadata_path, "w") as f:
+        with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
         logger.info(f"Saved metadata to {metadata_path}")
