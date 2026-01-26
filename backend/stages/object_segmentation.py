@@ -1542,18 +1542,50 @@ class ObjectSegmentationStage:
                     for i, obj_id in enumerate(obj_ids):
                         # Convert logits to binary mask
                         # mask_logits shape: (num_objects, 1, H, W)
-                        # Squeeze only dim 1 to get (H, W) at model resolution
                         raw_mask = (mask_logits[i] > 0.0).squeeze(0)  # (H, W)
+                        mask_h, mask_w = raw_mask.shape
 
-                        # Resize mask from model resolution to original video size
-                        # SAM-2 returns masks at internal resolution (e.g., 256x256)
+                        # Check if mask is already at video resolution
+                        # (SAM-2 post-processing worked correctly)
                         if (
                             self._video_height is not None
                             and self._video_width is not None
+                            and mask_h == self._video_height
+                            and mask_w == self._video_width
                         ):
+                            mask = raw_mask.cpu().numpy()
+                        elif (
+                            self._video_height is not None
+                            and self._video_width is not None
+                        ):
+                            # SAM-2 post-processing was skipped - masks at model resolution
+                            # SAM-2 internally pads to square (longest side), then resizes
+                            # We need to reverse this: crop the padding, then resize
+
+                            video_h = self._video_height
+                            video_w = self._video_width
+
+                            # Determine aspect ratio to find where content is in the mask
+                            if video_w >= video_h:
+                                # Landscape: height was padded
+                                # Content is in top portion: ratio = video_h / video_w
+                                content_ratio = video_h / video_w
+                                content_h = int(mask_h * content_ratio)
+                                content_w = mask_w
+                                # Crop to content region (top portion)
+                                cropped = raw_mask[:content_h, :content_w]
+                            else:
+                                # Portrait: width was padded
+                                content_ratio = video_w / video_h
+                                content_h = mask_h
+                                content_w = int(mask_w * content_ratio)
+                                # Crop to content region (left portion)
+                                cropped = raw_mask[:content_h, :content_w]
+
+                            # Now resize cropped mask to video dimensions
                             resized = F.interpolate(
-                                raw_mask.unsqueeze(0).unsqueeze(0).float(),
-                                size=(self._video_height, self._video_width),
+                                cropped.unsqueeze(0).unsqueeze(0).float(),
+                                size=(video_h, video_w),
                                 mode="bilinear",
                                 align_corners=False,
                             )
