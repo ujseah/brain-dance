@@ -10,12 +10,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
 # Configure structured logging
 logger = logging.getLogger(__name__)
+
+# Handle torch.cuda.OutOfMemoryError for CPU-only environments
+# On systems without CUDA, this exception class may not be catchable
+def _get_cuda_oom_error():
+    """Get the CUDA OOM error class safely."""
+    try:
+        error_class = torch.cuda.OutOfMemoryError
+        # Verify it's actually an exception class
+        if isinstance(error_class, type) and issubclass(error_class, BaseException):
+            return error_class
+    except (AttributeError, TypeError):
+        pass
+    # Fallback for CPU-only systems
+    class _FallbackOOMError(Exception):
+        """Placeholder for CUDA OOM error on CPU-only systems."""
+        pass
+    return _FallbackOOMError
+
+_CUDAOutOfMemoryError = _get_cuda_oom_error()
 
 # SAM-2 imports with graceful handling
 try:
@@ -108,6 +129,27 @@ DEFAULT_MAX_AREA_PERCENT = 0.30   # 30% of image area
 # Empirically tested - OOM typically occurs around 250 objects at 1080p/100 frames
 MAX_SAFE_OBJECTS = 200
 
+# Color palette for visualization (auto-assigned per object)
+# Colors chosen for good contrast and visibility on various backgrounds
+OBJECT_COLORS = [
+    (255, 0, 0),      # Red
+    (0, 255, 0),      # Green
+    (0, 0, 255),      # Blue
+    (255, 255, 0),    # Yellow
+    (255, 0, 255),    # Magenta
+    (0, 255, 255),    # Cyan
+    (255, 128, 0),    # Orange
+    (128, 0, 255),    # Purple
+    (0, 255, 128),    # Spring Green
+    (255, 0, 128),    # Rose
+    (128, 255, 0),    # Lime
+    (0, 128, 255),    # Sky Blue
+    (255, 128, 128),  # Light Red
+    (128, 255, 128),  # Light Green
+    (128, 128, 255),  # Light Blue
+    (255, 255, 128),  # Light Yellow
+]
+
 
 @dataclass
 class SegmentedObject:
@@ -189,6 +231,11 @@ class ObjectSegmentationStage:
         self.verbose_progress = self.config.get("verbose_progress", True)
         self.save_partial_on_oom = self.config.get("save_partial_on_oom", True)
 
+        # Visualization options (for GIF-friendly output)
+        self.generate_visualizations = self.config.get("generate_visualizations", True)
+        self.overlay_opacity = self.config.get("overlay_opacity", 0.3)
+        self.outline_width = self.config.get("outline_width", 2)
+
         # Validate area percent configuration
         if not (0 <= self.min_area_percent <= self.max_area_percent <= 1.0):
             raise ValueError(
@@ -201,6 +248,10 @@ class ObjectSegmentationStage:
         self.image_model = None
         self.mask_generator = None
         self.video_predictor = None
+
+        # Video dimensions for mask resizing (set in _init_video_state)
+        self._video_width = None
+        self._video_height = None
 
         # Device selection with CPU fallback for testing
         self.allow_cpu = self.config.get("allow_cpu", False)
@@ -1331,6 +1382,24 @@ class ObjectSegmentationStage:
                     offload_state_to_cpu=self.config.get("offload_state_to_cpu", False),
                 )
 
+            # Get original video frame dimensions for mask resizing
+            # SAM-2 returns masks at model resolution (256x256), not video resolution
+            frame_files = sorted(Path(frames_dir).glob("*.jpg")) + sorted(
+                Path(frames_dir).glob("*.png")
+            )
+            if frame_files:
+                with Image.open(frame_files[0]) as sample_frame:
+                    self._video_width, self._video_height = sample_frame.size
+                logger.info(
+                    f"Video dimensions: {self._video_width}x{self._video_height}"
+                )
+            else:
+                # Fallback - shouldn't happen if frames_dir validation passed
+                self._video_width, self._video_height = None, None
+                logger.warning(
+                    "Could not determine video dimensions - masks may be wrong size"
+                )
+
             init_time = time.perf_counter() - start_time
             self.metrics["video_state_init_time_seconds"] = init_time
             logger.info(f"Video state initialized in {init_time:.2f}s")
@@ -1472,8 +1541,26 @@ class ObjectSegmentationStage:
                     # Process each object's mask for this frame
                     for i, obj_id in enumerate(obj_ids):
                         # Convert logits to binary mask
-                        # mask_logits shape: (num_objects, 1, H, W); squeeze to (H, W)
-                        mask = (mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                        # mask_logits shape: (num_objects, 1, H, W)
+                        # Squeeze only dim 1 to get (H, W) at model resolution
+                        raw_mask = (mask_logits[i] > 0.0).squeeze(0)  # (H, W)
+
+                        # Resize mask from model resolution to original video size
+                        # SAM-2 returns masks at internal resolution (e.g., 256x256)
+                        if (
+                            self._video_height is not None
+                            and self._video_width is not None
+                        ):
+                            resized = F.interpolate(
+                                raw_mask.unsqueeze(0).unsqueeze(0).float(),
+                                size=(self._video_height, self._video_width),
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                            mask = (resized.squeeze() > 0.5).cpu().numpy()
+                        else:
+                            # Fallback if dimensions unknown
+                            mask = raw_mask.cpu().numpy()
 
                         # Skip empty masks (object not visible in this frame)
                         if not mask.any():
@@ -1507,7 +1594,7 @@ class ObjectSegmentationStage:
 
             return all_masks
 
-        except torch.cuda.OutOfMemoryError as e:
+        except _CUDAOutOfMemoryError as e:
             # Graceful OOM handling: save partial results if configured
             logger.error(
                 f"[SEG-ERR-019] CUDA OOM at frame {frames_processed}/{num_frames}"
@@ -1658,6 +1745,7 @@ class ObjectSegmentationStage:
         all_masks: dict,
         output_dir: Path,
         progress_callback: Optional[Callable[[float, str], None]] = None,
+        frames_dir: Optional[Path] = None,
     ) -> tuple:
         """
         Export tracked masks to disk and generate enhanced metadata.
@@ -1665,10 +1753,15 @@ class ObjectSegmentationStage:
         Creates directory structure: masks/{object_id}/{frame_idx:04d}.png
         Generates enhanced metadata with per-frame bbox, centroid, area for Stage 4.
 
+        If generate_visualizations is enabled, also creates:
+        - masks/combined/{frame_idx:04d}.png: All objects merged with unique colors
+        - masks/overlays/{frame_idx:04d}.png: Original frame with mask overlays
+
         Args:
             all_masks: Dictionary from _propagate_masks()
             output_dir: Base output directory
             progress_callback: Optional callback(progress, message)
+            frames_dir: Directory containing original frames (for overlays)
 
         Returns:
             Tuple of (List[SegmentedObject], enhanced_metadata_dict)
@@ -1722,6 +1815,25 @@ class ObjectSegmentationStage:
                     progress = masks_saved / total_masks
                     progress_callback(progress, f"Saving masks ({masks_saved}/{total_masks})")
 
+        # Generate combined/overlay visualizations for GIF creation
+        if self.generate_visualizations and frames_dir is not None:
+            logger.info("Generating combined and overlay visualizations")
+            viz_count = 0
+            for frame_idx, frame_data in all_masks.items():
+                try:
+                    self._create_combined_visualization(
+                        frame_data=frame_data,
+                        frame_idx=frame_idx,
+                        frames_dir=frames_dir,
+                        output_dir=output_dir,
+                    )
+                    viz_count += 1
+                except Exception as e:
+                    logger.warning(
+                        f"[SEG-WARN-019] Visualization failed for frame {frame_idx}: {e}"
+                    )
+            logger.info(f"Created visualizations for {viz_count} frames")
+
         # Build SegmentedObject list
         segmented_objects = []
         for obj_id in sorted(object_data.keys()):
@@ -1769,10 +1881,147 @@ class ObjectSegmentationStage:
             mask: Binary mask array (H, W) with dtype bool or 0/1 values
             path: Output path for PNG file
         """
+        # Validate mask dimensions - warn if unexpectedly small
+        # SAM-2 model resolution is typically 256x256; video should be larger
+        if mask.shape[0] < 100 or mask.shape[1] < 100:
+            expected_size = "unknown"
+            if hasattr(self, "_video_height") and self._video_height:
+                expected_size = f"{self._video_height}x{self._video_width}"
+            logger.warning(
+                f"[SEG-WARN-016] Mask unexpectedly small: {mask.shape[0]}x{mask.shape[1]}. "
+                f"Expected ~{expected_size}. Masks may not have been resized correctly."
+            )
+
         # Convert to 8-bit (0 = background, 255 = object)
         mask_uint8 = (mask.astype(np.uint8) * 255)
         img = Image.fromarray(mask_uint8, mode="L")
         img.save(path, compress_level=6)
+
+    def _create_combined_visualization(
+        self,
+        frame_data: List[Dict[str, Any]],
+        frame_idx: int,
+        frames_dir: Path,
+        output_dir: Path,
+    ) -> None:
+        """
+        Create combined mask and overlay visualization for a single frame.
+
+        Generates two outputs:
+        - combined/{frame_idx:04d}.png: RGB image with unique colors per object
+        - overlays/{frame_idx:04d}.png: Original frame with colored mask overlays
+
+        The combined output is ideal for creating GIFs that animate mask tracking.
+        The overlay output shows masks on the original video for verification.
+
+        Args:
+            frame_data: List of object data dicts for this frame
+                Each dict has: object_id, mask, bbox, centroid, area
+            frame_idx: Index of the current frame
+            frames_dir: Directory containing original video frames
+            output_dir: Base output directory (combined/ and overlays/ subdirs created)
+        """
+        from PIL import ImageDraw
+
+        # Create output directories
+        combined_dir = output_dir / "masks" / "combined"
+        overlays_dir = output_dir / "masks" / "overlays"
+        combined_dir.mkdir(parents=True, exist_ok=True)
+        overlays_dir.mkdir(parents=True, exist_ok=True)
+
+        # Detect frame indexing by finding actual first frame number
+        # Handles arbitrary start indices (e.g., 0000, 0001, 0005, etc.)
+        frame_offset = 0
+        frame_files = sorted(
+            list(frames_dir.glob("*.jpg")) +
+            list(frames_dir.glob("*.jpeg")) +
+            list(frames_dir.glob("*.png"))
+        )
+        if frame_files:
+            try:
+                frame_offset = int(frame_files[0].stem)
+            except ValueError:
+                frame_offset = 0  # Fall back if filename isn't numeric
+
+        # Find and load original frame using detected scheme
+        frame_path = None
+        for ext in [".jpg", ".jpeg", ".png"]:
+            candidate = frames_dir / f"{frame_idx + frame_offset:04d}{ext}"
+            if candidate.exists():
+                frame_path = candidate
+                break
+
+        if frame_path is None:
+            logger.warning(
+                f"[SEG-WARN-017] Could not find frame {frame_idx} for visualization"
+            )
+            return
+
+        try:
+            original = Image.open(frame_path).convert("RGBA")
+        except Exception as e:
+            logger.warning(
+                f"[SEG-WARN-018] Failed to load frame {frame_path}: {e}"
+            )
+            return
+
+        img_width, img_height = original.size
+
+        # Create blank combined mask (transparent background)
+        combined = Image.new("RGBA", (img_width, img_height), (0, 0, 0, 255))
+        overlay = original.copy()
+        overlay_draw = ImageDraw.Draw(overlay)
+
+        # Opacity for fill (0-255 range)
+        fill_alpha = int(self.overlay_opacity * 255)
+
+        for obj_info in frame_data:
+            obj_id = obj_info["object_id"]
+            mask = obj_info["mask"]
+
+            # Get color for this object (cycle through palette)
+            color = OBJECT_COLORS[obj_id % len(OBJECT_COLORS)]
+
+            # Create colored fill for combined view (solid color)
+            combined_fill = Image.new("RGBA", (img_width, img_height), (*color, 255))
+            mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+            combined.paste(combined_fill, mask=mask_img)
+            combined_fill.close()
+
+            # Create semi-transparent fill for overlay
+            overlay_fill = Image.new("RGBA", (img_width, img_height), (*color, fill_alpha))
+            overlay.paste(overlay_fill, mask=mask_img)
+            overlay_fill.close()
+            mask_img.close()
+
+            # Draw outline using contours
+            try:
+                # Find contours in the mask
+                mask_uint8 = mask.astype(np.uint8)
+                contours, _ = cv2.findContours(
+                    mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+
+                # Draw contours on overlay
+                for contour in contours:
+                    if len(contour) < 3:
+                        continue
+                    # Convert contour points to list of tuples
+                    points = [(int(p[0][0]), int(p[0][1])) for p in contour]
+                    if len(points) > 2:
+                        # Draw closed polygon outline
+                        overlay_draw.line(
+                            points + [points[0]],
+                            fill=color,
+                            width=self.outline_width
+                        )
+            except Exception as e:
+                logger.debug(f"Contour drawing failed for object {obj_id}: {e}")
+
+        # Save outputs
+        output_filename = f"{frame_idx:04d}.png"
+        combined.convert("RGB").save(combined_dir / output_filename)
+        overlay.convert("RGB").save(overlays_dir / output_filename)
 
     def _save_enhanced_metadata(
         self,
@@ -1921,6 +2170,7 @@ class ObjectSegmentationStage:
                 all_masks,
                 output_dir,
                 lambda p, m: report(0.75 + p * 0.20, m),
+                frames_dir=frames_dir,
             )
 
             # Step 6: Save enhanced metadata

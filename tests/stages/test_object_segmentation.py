@@ -1,18 +1,17 @@
-"""Unit tests for Object Segmentation Stage (Phase 2 & 3)."""
+"""Unit tests for Object Segmentation Stage (Phase 2 & 3).
+
+Note: These tests require torch to be installed.
+Run in an environment with torch (e.g., Google Colab) or install torch locally.
+"""
 
 import json
-import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import numpy as np
 import pytest
-
-# Mock torch before importing the module to avoid dependency
-mock_torch = MagicMock()
-mock_torch.cuda.is_available.return_value = False
-sys.modules["torch"] = mock_torch
+import torch
 
 from backend.stages.object_segmentation import (
     ObjectSegmentationStage,
@@ -58,15 +57,19 @@ def stage_config():
 
 @pytest.fixture
 def temp_frames_dir():
-    """Create temporary directory with fake frame files."""
+    """Create temporary directory with real frame files."""
+    from PIL import Image
+
     with tempfile.TemporaryDirectory() as tmpdir:
         frames_dir = Path(tmpdir) / "frames"
         frames_dir.mkdir()
 
-        # Create 25 fake frame files
+        # Create 25 small test images (100x100 pixels)
         for i in range(25):
             frame_path = frames_dir / f"{i+1:04d}.jpg"
-            frame_path.touch()
+            # Create a simple colored image
+            img = Image.new("RGB", (100, 100), color=(i * 10 % 256, 100, 150))
+            img.save(frame_path)
 
         yield frames_dir
 
@@ -317,13 +320,14 @@ class TestGetQualityPreset:
     """Tests for _get_quality_preset method."""
 
     def test_fast_preset(self):
-        """Fast preset returns correct parameters."""
+        """Fast preset returns correct parameters (fewer objects, faster)."""
         stage = ObjectSegmentationStage({"quality_preset": "fast", "allow_cpu": True})
         preset = stage._get_quality_preset()
 
-        assert preset["points_per_side"] == 48
-        assert preset["pred_iou_thresh"] == 0.6
-        assert preset["stability_score_thresh"] == 0.75
+        # Fast: fewer points + higher thresholds = fewer detected objects
+        assert preset["points_per_side"] == 24
+        assert preset["pred_iou_thresh"] == 0.8
+        assert preset["stability_score_thresh"] == 0.9
 
     def test_balanced_preset(self):
         """Balanced preset returns correct parameters."""
@@ -335,13 +339,15 @@ class TestGetQualityPreset:
         assert preset["stability_score_thresh"] == 0.85
 
     def test_thorough_preset(self):
-        """Thorough preset returns correct parameters."""
+        """Thorough preset (deprecated) maps to detailed preset."""
         stage = ObjectSegmentationStage({"quality_preset": "thorough", "allow_cpu": True})
         preset = stage._get_quality_preset()
 
-        assert preset["points_per_side"] == 64
-        assert preset["pred_iou_thresh"] == 0.8
-        assert preset["stability_score_thresh"] == 0.9
+        # thorough is deprecated, maps to detailed
+        # Detailed: more points + lower thresholds = more objects
+        assert preset["points_per_side"] == 48
+        assert preset["pred_iou_thresh"] == 0.6
+        assert preset["stability_score_thresh"] == 0.75
 
     def test_invalid_preset_defaults_to_balanced(self):
         """Invalid preset falls back to balanced."""
@@ -695,24 +701,21 @@ class TestPropagateMasks:
     def test_iterates_generator_correctly(self, stage_config):
         """Verify generator consumption and mask processing."""
         stage = ObjectSegmentationStage(stage_config)
+        # Set video dimensions for mask resizing
+        stage._video_height = 50
+        stage._video_width = 50
+
+        # Create real tensor for mask_logits (num_objects, 1, H, W)
+        test_logits = torch.ones((2, 1, 50, 50))
 
         # Create mock generator that yields 3 frames
-        def mock_generator(inference_state):
+        def mock_propagate(inference_state):
             for frame_idx in range(3):
                 obj_ids = [0, 1]
-                # Mock mask logits as tensor-like
-                mask_logits = MagicMock()
-                mask_logits.__getitem__ = lambda self, i: MagicMock(
-                    __gt__=lambda self, v: MagicMock(
-                        cpu=lambda: MagicMock(
-                            numpy=lambda: np.ones((50, 50), dtype=bool)
-                        )
-                    )
-                )
-                yield frame_idx, obj_ids, mask_logits
+                yield frame_idx, obj_ids, test_logits
 
         mock_predictor = MagicMock()
-        mock_predictor.propagate_in_video.return_value = mock_generator({})
+        mock_predictor.propagate_in_video.side_effect = mock_propagate
         stage.video_predictor = mock_predictor
 
         result = stage._propagate_masks({}, num_frames=3)
@@ -726,23 +729,21 @@ class TestPropagateMasks:
     def test_computes_per_frame_metadata(self, stage_config):
         """Verify bbox, centroid, area computed for each frame."""
         stage = ObjectSegmentationStage(stage_config)
+        # Set video dimensions for mask resizing
+        stage._video_height = 100
+        stage._video_width = 100
 
-        # Create a simple mask
-        test_mask = np.zeros((100, 100), dtype=bool)
-        test_mask[20:40, 30:60] = True
+        # Create a simple mask tensor (num_objects, 1, H, W) with foreground region
+        # SAM-2 uses logits where >0 = foreground
+        test_logits = torch.zeros((1, 1, 100, 100))
+        test_logits[0, 0, 20:40, 30:60] = 1.0  # Set foreground region
 
-        def mock_generator(inference_state):
+        def mock_propagate(inference_state):
             obj_ids = [0]
-            mask_logits = MagicMock()
-            mask_logits.__getitem__ = lambda self, i: MagicMock(
-                __gt__=lambda self, v: MagicMock(
-                    cpu=lambda: MagicMock(numpy=lambda: test_mask)
-                )
-            )
-            yield 0, obj_ids, mask_logits
+            yield 0, obj_ids, test_logits
 
         mock_predictor = MagicMock()
-        mock_predictor.propagate_in_video.return_value = mock_generator({})
+        mock_predictor.propagate_in_video.side_effect = mock_propagate
         stage.video_predictor = mock_predictor
 
         result = stage._propagate_masks({}, num_frames=1)
@@ -867,27 +868,27 @@ class TestTrackObjectsOrchestration:
 
     def test_full_pipeline_with_mock(self, stage_config, temp_frames_dir, temp_output_dir):
         """Integration test with mocked video predictor."""
+        import torch
+
         stage = ObjectSegmentationStage(stage_config)
+        # Set video dimensions for mask resizing (matches test images)
+        stage._video_height = 100
+        stage._video_width = 100
 
         # Setup mock video predictor
         mock_predictor = MagicMock()
         mock_predictor.init_state.return_value = {"test": "state"}
         mock_predictor.add_new_points_or_box.return_value = (0, [0], np.ones((1, 50, 50)))
 
-        # Create mask data
-        test_mask = np.ones((50, 50), dtype=bool)
+        # Create mask logits tensor (num_objects, 1, H, W)
+        test_logits = torch.ones((1, 1, 100, 100))
 
-        def mock_generator(inference_state):
+        def mock_propagate(inference_state):
+            """Generator that yields frames with mask logits."""
             for frame_idx in range(3):
-                mask_logits = MagicMock()
-                mask_logits.__getitem__ = lambda self, i: MagicMock(
-                    __gt__=lambda self, v: MagicMock(
-                        cpu=lambda: MagicMock(numpy=lambda: test_mask)
-                    )
-                )
-                yield frame_idx, [0], mask_logits
+                yield frame_idx, [0], test_logits
 
-        mock_predictor.propagate_in_video.return_value = mock_generator({})
+        mock_predictor.propagate_in_video.side_effect = mock_propagate
         stage.video_predictor = mock_predictor
 
         # Create frame files
