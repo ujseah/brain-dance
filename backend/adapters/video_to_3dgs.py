@@ -246,6 +246,11 @@ class VideoTo3DGSAdapter(WorldModelAdapter):
                 "min_object_size": options.min_object_size,
                 "model_size": options.model_size,
                 "quality_preset": options.quality_preset,
+                "max_objects": options.max_objects,
+                "min_area_percent": options.min_area_percent,
+                "max_area_percent": options.max_area_percent,
+                "verbose_progress": options.verbose_progress,
+                "save_partial_on_oom": options.save_partial_on_oom,
             })
 
         return self._segmentation_stage.segment(frames_dir, output_dir, progress_callback)

@@ -8,7 +8,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, List
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import numpy as np
@@ -101,6 +101,10 @@ SEGMENTATION_PRESETS = {
 DEFAULT_MAX_OBJECTS = 50
 DEFAULT_MIN_AREA_PERCENT = 0.001  # 0.1% of image area
 DEFAULT_MAX_AREA_PERCENT = 0.30   # 30% of image area
+
+# Maximum objects that can be reliably tracked without OOM on typical GPUs
+# Exceeding this triggers a hard error rather than attempting and failing
+MAX_SAFE_OBJECTS = 200
 
 
 @dataclass
@@ -404,6 +408,15 @@ class ObjectSegmentationStage:
             Dictionary with points_per_side, pred_iou_thresh, stability_score_thresh
         """
         preset_name = self.quality_preset
+
+        # Backward compatibility: "thorough" was renamed to "detailed"
+        if preset_name == "thorough":
+            logger.warning(
+                "[SEG-WARN-020] Quality preset 'thorough' is deprecated and will be "
+                "removed in a future version. Please use 'detailed' instead."
+            )
+            preset_name = "detailed"
+
         if preset_name not in SEGMENTATION_PRESETS:
             logger.warning(
                 f"[SEG-WARN-003] Invalid quality preset '{preset_name}', using 'balanced'"
@@ -960,13 +973,14 @@ class ObjectSegmentationStage:
         return merged
 
     def _filter_by_area(
-        self, detections: List[dict], image_area: int
-    ) -> List[dict]:
+        self, detections: List[Dict[str, Any]], image_area: int
+    ) -> List[Dict[str, Any]]:
         """
         Filter objects by percentage of image area.
 
         Removes objects that are too small (noise/fragments) or too large
-        (likely background or scene-spanning regions).
+        (likely background or scene-spanning regions). Also filters objects
+        with invalid (zero or negative) area.
 
         Args:
             detections: List of detections
@@ -978,10 +992,14 @@ class ObjectSegmentationStage:
         min_area = image_area * self.min_area_percent
         max_area = image_area * self.max_area_percent
 
-        filtered = [
-            d for d in detections
-            if min_area <= d.get("area", 0) <= max_area
-        ]
+        filtered = []
+        for d in detections:
+            area = d.get("area", 0)
+            # Skip objects with invalid (zero or negative) area
+            if area <= 0:
+                continue
+            if min_area <= area <= max_area:
+                filtered.append(d)
 
         removed = len(detections) - len(filtered)
         if removed > 0:
@@ -993,8 +1011,8 @@ class ObjectSegmentationStage:
         return filtered
 
     def _select_top_objects(
-        self, detections: List[dict], max_objects: int
-    ) -> List[dict]:
+        self, detections: List[Dict[str, Any]], max_objects: int
+    ) -> List[Dict[str, Any]]:
         """
         Select top N objects by confidence score.
 
@@ -1062,32 +1080,44 @@ class ObjectSegmentationStage:
 
         Provides early warning/failure rather than OOM 20 minutes into processing.
 
+        VRAM estimation uses conservative heuristics based on SAM-2 architecture:
+        - Base model: 4-16GB depending on variant (tiny/small/base_plus/large)
+        - Per-object: ~15MB for embedding tensors and tracking state
+        - Per-frame: ~5MB for propagation state
+
+        These approximations were tested on T4 (15GB) and RTX 3090 (24GB).
+        The validation is warn-only for VRAM to avoid blocking valid use cases.
+
         Args:
             num_objects: Number of objects to track
             num_frames: Number of frames in video
 
         Raises:
-            ValueError: If object count exceeds hard limit
+            ValueError: If object count exceeds MAX_SAFE_OBJECTS
         """
         # Hard limit to prevent guaranteed OOM
-        hard_limit = 200
-        if num_objects > hard_limit:
+        if num_objects > MAX_SAFE_OBJECTS:
             raise ValueError(
                 f"[SEG-ERR-018] Detected {num_objects} objects - too many to track reliably. "
-                f"Maximum supported: {hard_limit}. "
+                f"Maximum supported: {MAX_SAFE_OBJECTS}. "
                 f"Try using quality_preset='fast' or a simpler video."
             )
 
-        # Estimate VRAM requirement (rough heuristic based on SAM-2 behavior)
+        # Estimate VRAM requirement (conservative heuristic based on SAM-2 behavior)
         # Base model + per-object tracking state + frame encodings
         model_vram = SAM2_MODELS.get(
             self.config.get("model_size", "tiny"), {}
         ).get("vram_gb", 4.0)
 
+        # Per-object overhead: embedding tensors (~15MB each)
+        per_object_overhead_gb = 0.015
+        # Per-frame overhead: propagation state (~5MB each)
+        per_frame_overhead_gb = 0.005
+
         estimated_vram_gb = (
             model_vram +
-            (num_objects * 0.015) +  # ~15MB per object tracking state
-            (num_frames * 0.005)     # ~5MB per frame encoding
+            (num_objects * per_object_overhead_gb) +
+            (num_frames * per_frame_overhead_gb)
         )
 
         if self.device == "cuda":
@@ -1374,10 +1404,11 @@ class ObjectSegmentationStage:
 
     def _propagate_masks(
         self,
-        inference_state: dict,
+        inference_state: Dict[str, Any],
         num_frames: int,
+        output_dir: Optional[Path] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
-    ) -> dict:
+    ) -> Dict[int, List[Dict[str, Any]]]:
         """
         Propagate masks through all video frames using SAM-2 video tracking.
 
@@ -1387,6 +1418,7 @@ class ObjectSegmentationStage:
         Args:
             inference_state: SAM-2 video inference state with prompts added
             num_frames: Total number of frames in video
+            output_dir: Optional output directory for saving partial results on OOM
             progress_callback: Optional callback(progress, message)
 
         Returns:
@@ -1466,18 +1498,43 @@ class ObjectSegmentationStage:
                 f"[SEG-ERR-019] CUDA OOM at frame {frames_processed}/{num_frames}"
             )
 
-            if self.save_partial_on_oom and all_masks:
-                logger.info(
-                    f"Partial results available: {len(all_masks)} frames tracked "
-                    f"before OOM. These can be saved if save_partial_on_oom is enabled."
-                )
-                # Store partial results in metrics for potential recovery
-                self.metrics["partial_masks_available"] = True
-                self.metrics["partial_frames_tracked"] = len(all_masks)
+            partial_saved = False
+            partial_dir = None
 
+            if self.save_partial_on_oom and all_masks and output_dir is not None:
+                partial_dir = output_dir / "partial_results"
+                try:
+                    logger.info(
+                        f"Saving partial results: {len(all_masks)} frames tracked "
+                        f"before OOM to {partial_dir}"
+                    )
+                    # Export what we have so far
+                    self._export_tracks(
+                        all_masks=all_masks,
+                        output_dir=partial_dir,
+                        progress_callback=None,
+                    )
+                    partial_saved = True
+                    logger.info(f"Partial results saved to {partial_dir}")
+                except Exception as save_error:
+                    logger.warning(
+                        f"Failed to save partial results: {save_error}"
+                    )
+
+            # Store partial results info in metrics
+            self.metrics["partial_masks_available"] = partial_saved
+            self.metrics["partial_frames_tracked"] = len(all_masks)
+            if partial_dir:
+                self.metrics["partial_results_dir"] = str(partial_dir)
+
+            partial_msg = (
+                f"Partial results saved to {partial_dir}. "
+                if partial_saved else ""
+            )
             raise RuntimeError(
                 f"[SEG-ERR-019] Ran out of GPU memory at frame {frames_processed}/{num_frames}.\n"
                 f"Tracked {len(all_masks)} frames before failure.\n"
+                f"{partial_msg}"
                 f"Try reducing max_objects (currently {self.max_objects}) or video resolution.\n"
                 f"Original error: {e}"
             ) from e
@@ -1828,7 +1885,8 @@ class ObjectSegmentationStage:
             all_masks = self._propagate_masks(
                 inference_state,
                 num_frames,
-                lambda p, m: report(0.15 + p * 0.55, m),
+                output_dir=output_dir,
+                progress_callback=lambda p, m: report(0.15 + p * 0.55, m),
             )
 
             # Handle case where no masks were propagated
