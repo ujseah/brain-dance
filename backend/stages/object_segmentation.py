@@ -71,24 +71,36 @@ SAM2_MODELS = {
 }
 
 # Quality presets for mask generator
-# Controls trade-off between speed and segmentation quality
+# Controls trade-off between speed/memory and segmentation quality
+#
+# NOTE: "fast" means faster processing with FEWER objects detected (higher thresholds).
+# "detailed" finds more objects but uses more memory and takes longer.
 SEGMENTATION_PRESETS = {
     "fast": {
-        "points_per_side": 48,
-        "pred_iou_thresh": 0.6,
-        "stability_score_thresh": 0.75,
+        # Fast mode: fewer sample points + higher thresholds = fewer objects = faster
+        "points_per_side": 24,
+        "pred_iou_thresh": 0.8,
+        "stability_score_thresh": 0.9,
     },
     "balanced": {
+        # Balanced: moderate settings for typical use cases
         "points_per_side": 32,
         "pred_iou_thresh": 0.7,
         "stability_score_thresh": 0.85,
     },
-    "thorough": {
-        "points_per_side": 64,
-        "pred_iou_thresh": 0.8,
-        "stability_score_thresh": 0.9,
+    "detailed": {
+        # Detailed: more sample points + lower thresholds = more objects = slower
+        # WARNING: May detect hundreds of objects in complex scenes, requiring more VRAM
+        "points_per_side": 48,
+        "pred_iou_thresh": 0.6,
+        "stability_score_thresh": 0.75,
     },
 }
+
+# Default limits for object tracking (prevents OOM on limited VRAM GPUs)
+DEFAULT_MAX_OBJECTS = 50
+DEFAULT_MIN_AREA_PERCENT = 0.001  # 0.1% of image area
+DEFAULT_MAX_AREA_PERCENT = 0.30   # 30% of image area
 
 
 @dataclass
@@ -162,6 +174,14 @@ class ObjectSegmentationStage:
         self.keyframe_interval = self.config.get("keyframe_interval", 10)
         self.min_object_size = self.config.get("min_object_size", 100)
         self.quality_preset = self.config.get("quality_preset", "balanced")
+
+        # Object limiting and filtering (prevents OOM on limited VRAM)
+        self.max_objects = self.config.get("max_objects", DEFAULT_MAX_OBJECTS)
+        self.object_selection = self.config.get("object_selection", "confidence")
+        self.min_area_percent = self.config.get("min_area_percent", DEFAULT_MIN_AREA_PERCENT)
+        self.max_area_percent = self.config.get("max_area_percent", DEFAULT_MAX_AREA_PERCENT)
+        self.verbose_progress = self.config.get("verbose_progress", True)
+        self.save_partial_on_oom = self.config.get("save_partial_on_oom", True)
 
         # Dual-model architecture: image model for Phase 2, video predictor for Phase 3
         self.image_model = None
@@ -692,7 +712,29 @@ class ObjectSegmentationStage:
             initial_detections = self._segment_keyframes(
                 frame_files, keyframe_indices, keyframe_progress
             )
-            report(0.3, f"Discovered {len(initial_detections)} unique objects in keyframes")
+            raw_count = len(initial_detections)
+            report(0.3, f"Discovered {raw_count} objects in keyframes")
+
+            # ===== OBJECT FILTERING (prevents OOM on complex scenes) =====
+            # Get image dimensions for area-based filtering
+            first_frame = Image.open(frame_files[0])
+            image_area = first_frame.width * first_frame.height
+
+            # Step 1: Filter by area (remove tiny fragments and huge regions)
+            filtered_detections = self._filter_by_area(initial_detections, image_area)
+
+            # Step 2: Select top N by confidence if still too many
+            filtered_detections = self._select_top_objects(
+                filtered_detections, self.max_objects
+            )
+
+            # User-friendly messaging
+            user_message = self._get_user_message(raw_count, len(filtered_detections))
+            if user_message:
+                report(0.31, user_message)
+                logger.info(user_message)
+
+            initial_detections = filtered_detections
 
         finally:
             # CRITICAL: Unload image model to free VRAM before loading video predictor
@@ -723,11 +765,14 @@ class ObjectSegmentationStage:
             )
 
         # ===== PHASE 3: Object Tracking =====
+        # Validate before expensive tracking operation
+        self._validate_before_tracking(len(initial_detections), len(frame_files))
+
         report(0.35, "Loading SAM-2 video predictor for object tracking")
         self._load_video_predictor()
 
         try:
-            report(0.4, "Tracking objects across all frames")
+            report(0.4, f"Tracking {len(initial_detections)} objects across {len(frame_files)} frames")
             tracked_objects = self._track_objects(
                 frame_files,
                 initial_detections,
@@ -913,6 +958,149 @@ class ObjectSegmentationStage:
             f"Merged {len(detections)} detections into {len(merged)} unique objects"
         )
         return merged
+
+    def _filter_by_area(
+        self, detections: List[dict], image_area: int
+    ) -> List[dict]:
+        """
+        Filter objects by percentage of image area.
+
+        Removes objects that are too small (noise/fragments) or too large
+        (likely background or scene-spanning regions).
+
+        Args:
+            detections: List of detections
+            image_area: Total image area in pixels (width * height)
+
+        Returns:
+            Filtered list of detections
+        """
+        min_area = image_area * self.min_area_percent
+        max_area = image_area * self.max_area_percent
+
+        filtered = [
+            d for d in detections
+            if min_area <= d.get("area", 0) <= max_area
+        ]
+
+        removed = len(detections) - len(filtered)
+        if removed > 0:
+            logger.info(
+                f"Filtered {removed} objects by area "
+                f"(keeping {self.min_area_percent*100:.1f}%-{self.max_area_percent*100:.0f}% of image)"
+            )
+
+        return filtered
+
+    def _select_top_objects(
+        self, detections: List[dict], max_objects: int
+    ) -> List[dict]:
+        """
+        Select top N objects by confidence score.
+
+        When too many objects are detected, keeps only the most confident
+        detections to prevent OOM during video tracking.
+
+        Args:
+            detections: List of detections
+            max_objects: Maximum number of objects to keep
+
+        Returns:
+            Top N detections by confidence
+        """
+        if len(detections) <= max_objects:
+            return detections
+
+        # Sort by predicted_iou (SAM-2's confidence score), falling back to 'confidence'
+        sorted_dets = sorted(
+            detections,
+            key=lambda x: x.get("predicted_iou", x.get("confidence", 0)),
+            reverse=True
+        )
+        selected = sorted_dets[:max_objects]
+
+        logger.info(
+            f"Selected top {max_objects} objects by confidence "
+            f"(from {len(detections)} detected)"
+        )
+
+        return selected
+
+    def _get_user_message(self, detected: int, tracking: int) -> str:
+        """
+        Generate user-friendly message based on object counts.
+
+        Provides context-appropriate messaging for non-technical users.
+
+        Args:
+            detected: Number of objects detected
+            tracking: Number of objects being tracked (after filtering)
+
+        Returns:
+            User-friendly message string, or empty string if no message needed
+        """
+        if detected <= 50:
+            return ""
+        elif detected <= 100:
+            return f"Found {detected} objects. Processing the {tracking} most prominent."
+        elif detected <= 200:
+            return (
+                f"Found {detected} objects in your video. This usually means a complex "
+                f"scene. We're focusing on the {tracking} main objects."
+            )
+        else:
+            return (
+                f"Found {detected} objects - your video has a lot of detail! "
+                f"Processing top {tracking} objects to ensure completion."
+            )
+
+    def _validate_before_tracking(
+        self, num_objects: int, num_frames: int
+    ) -> None:
+        """
+        Validate object count and estimate VRAM before expensive tracking.
+
+        Provides early warning/failure rather than OOM 20 minutes into processing.
+
+        Args:
+            num_objects: Number of objects to track
+            num_frames: Number of frames in video
+
+        Raises:
+            ValueError: If object count exceeds hard limit
+        """
+        # Hard limit to prevent guaranteed OOM
+        hard_limit = 200
+        if num_objects > hard_limit:
+            raise ValueError(
+                f"[SEG-ERR-018] Detected {num_objects} objects - too many to track reliably. "
+                f"Maximum supported: {hard_limit}. "
+                f"Try using quality_preset='fast' or a simpler video."
+            )
+
+        # Estimate VRAM requirement (rough heuristic based on SAM-2 behavior)
+        # Base model + per-object tracking state + frame encodings
+        model_vram = SAM2_MODELS.get(
+            self.config.get("model_size", "tiny"), {}
+        ).get("vram_gb", 4.0)
+
+        estimated_vram_gb = (
+            model_vram +
+            (num_objects * 0.015) +  # ~15MB per object tracking state
+            (num_frames * 0.005)     # ~5MB per frame encoding
+        )
+
+        if self.device == "cuda":
+            available_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+
+            if estimated_vram_gb > available_vram_gb * 0.9:  # 90% threshold
+                logger.warning(
+                    f"[SEG-WARN-015] Estimated VRAM usage: {estimated_vram_gb:.1f}GB "
+                    f"(available: {available_vram_gb:.1f}GB). "
+                    f"This may cause OOM. Consider reducing max_objects."
+                )
+        else:
+            logger.info(f"Estimated VRAM requirement: {estimated_vram_gb:.1f}GB")
 
     def _segment_keyframes(
         self,
@@ -1271,6 +1459,28 @@ class ObjectSegmentationStage:
             )
 
             return all_masks
+
+        except torch.cuda.OutOfMemoryError as e:
+            # Graceful OOM handling: save partial results if configured
+            logger.error(
+                f"[SEG-ERR-019] CUDA OOM at frame {frames_processed}/{num_frames}"
+            )
+
+            if self.save_partial_on_oom and all_masks:
+                logger.info(
+                    f"Partial results available: {len(all_masks)} frames tracked "
+                    f"before OOM. These can be saved if save_partial_on_oom is enabled."
+                )
+                # Store partial results in metrics for potential recovery
+                self.metrics["partial_masks_available"] = True
+                self.metrics["partial_frames_tracked"] = len(all_masks)
+
+            raise RuntimeError(
+                f"[SEG-ERR-019] Ran out of GPU memory at frame {frames_processed}/{num_frames}.\n"
+                f"Tracked {len(all_masks)} frames before failure.\n"
+                f"Try reducing max_objects (currently {self.max_objects}) or video resolution.\n"
+                f"Original error: {e}"
+            ) from e
 
         except Exception as e:
             raise RuntimeError(

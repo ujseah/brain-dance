@@ -38,7 +38,22 @@ class SegmentationOptions:
     """SAM-2 model size: 'tiny', 'small', 'base_plus', 'large'."""
 
     quality_preset: str = "balanced"
-    """Quality preset for mask generation: 'fast', 'balanced', 'thorough'."""
+    """Quality preset for mask generation: 'fast', 'balanced', 'detailed'."""
+
+    max_objects: int = 50
+    """Maximum objects to track. Prevents OOM on complex scenes."""
+
+    min_area_percent: float = 0.001
+    """Minimum object area as fraction of image (0.1% default). Filters tiny fragments."""
+
+    max_area_percent: float = 0.30
+    """Maximum object area as fraction of image (30% default). Filters scene-spanning regions."""
+
+    verbose_progress: bool = True
+    """Show user-friendly progress messages about object filtering."""
+
+    save_partial_on_oom: bool = True
+    """If OOM occurs during tracking, report partial progress for debugging."""
 
 
 @dataclass
