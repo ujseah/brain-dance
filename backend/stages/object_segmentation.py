@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
@@ -1549,8 +1551,6 @@ class ObjectSegmentationStage:
                             self._video_height is not None
                             and self._video_width is not None
                         ):
-                            import torch.nn.functional as F
-
                             resized = F.interpolate(
                                 raw_mask.unsqueeze(0).unsqueeze(0).float(),
                                 size=(self._video_height, self._video_width),
@@ -1922,7 +1922,6 @@ class ObjectSegmentationStage:
             output_dir: Base output directory (combined/ and overlays/ subdirs created)
         """
         from PIL import ImageDraw
-        import cv2
 
         # Create output directories
         combined_dir = output_dir / "masks" / "combined"
@@ -1930,15 +1929,20 @@ class ObjectSegmentationStage:
         combined_dir.mkdir(parents=True, exist_ok=True)
         overlays_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find and load original frame
+        # Detect frame indexing scheme (0-based vs 1-based) by checking first frame
+        frame_offset = 0
+        for ext in [".jpg", ".jpeg", ".png"]:
+            if (frames_dir / f"0000{ext}").exists():
+                frame_offset = 0
+                break
+            if (frames_dir / f"0001{ext}").exists():
+                frame_offset = 1
+                break
+
+        # Find and load original frame using detected scheme
         frame_path = None
         for ext in [".jpg", ".jpeg", ".png"]:
-            candidate = frames_dir / f"{frame_idx:04d}{ext}"
-            if candidate.exists():
-                frame_path = candidate
-                break
-            # Also try 1-based indexing
-            candidate = frames_dir / f"{frame_idx + 1:04d}{ext}"
+            candidate = frames_dir / f"{frame_idx + frame_offset:04d}{ext}"
             if candidate.exists():
                 frame_path = candidate
                 break
