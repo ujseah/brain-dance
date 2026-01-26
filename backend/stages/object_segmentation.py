@@ -1929,15 +1929,19 @@ class ObjectSegmentationStage:
         combined_dir.mkdir(parents=True, exist_ok=True)
         overlays_dir.mkdir(parents=True, exist_ok=True)
 
-        # Detect frame indexing scheme (0-based vs 1-based) by checking first frame
+        # Detect frame indexing by finding actual first frame number
+        # Handles arbitrary start indices (e.g., 0000, 0001, 0005, etc.)
         frame_offset = 0
-        for ext in [".jpg", ".jpeg", ".png"]:
-            if (frames_dir / f"0000{ext}").exists():
-                frame_offset = 0
-                break
-            if (frames_dir / f"0001{ext}").exists():
-                frame_offset = 1
-                break
+        frame_files = sorted(
+            list(frames_dir.glob("*.jpg")) +
+            list(frames_dir.glob("*.jpeg")) +
+            list(frames_dir.glob("*.png"))
+        )
+        if frame_files:
+            try:
+                frame_offset = int(frame_files[0].stem)
+            except ValueError:
+                frame_offset = 0  # Fall back if filename isn't numeric
 
         # Find and load original frame using detected scheme
         frame_path = None
@@ -1982,10 +1986,13 @@ class ObjectSegmentationStage:
             combined_fill = Image.new("RGBA", (img_width, img_height), (*color, 255))
             mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
             combined.paste(combined_fill, mask=mask_img)
+            combined_fill.close()
 
             # Create semi-transparent fill for overlay
             overlay_fill = Image.new("RGBA", (img_width, img_height), (*color, fill_alpha))
             overlay.paste(overlay_fill, mask=mask_img)
+            overlay_fill.close()
+            mask_img.close()
 
             # Draw outline using contours
             try:
