@@ -67,3 +67,14 @@ opencv-python>=4.8.0
 # =============================================================================
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
+
+# =============================================================================
+# GPU Dependencies (server only)
+# =============================================================================
+# For GPU server setup, install additional dependencies:
+#   pip install -r backend/requirements-gpu.txt
+#
+# Then compile CUDA kernels:
+#   bash scripts/setup_instant4d.sh
+#
+# See docs/SETUP.md for detailed instructions.
