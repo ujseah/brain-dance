@@ -13,6 +13,9 @@ from .video_to_3dgs import VideoTo3DGSAdapter
 # Legacy adapter (kept for MoGe-V2 depth estimation in hole-filling)
 from .versecrafter import VerseCrafterAdapter
 
+# Instant4D adapter for 4D Gaussian Splatting (used internally by GaussianTrainingStage)
+from .instant4d import Instant4DAdapter, Instant4DOptions, Instant4DResult
+
 # Registry of available adapters
 ADAPTERS = {
     "video_to_3dgs": VideoTo3DGSAdapter,
@@ -68,6 +71,9 @@ __all__ = [
     "CameraInfo",
     "VideoTo3DGSAdapter",
     "VerseCrafterAdapter",
+    "Instant4DAdapter",
+    "Instant4DOptions",
+    "Instant4DResult",
     "get_adapter",
     "list_adapters",
     "ADAPTERS",
