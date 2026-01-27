@@ -1,0 +1,58 @@
+# Brain Dance GPU Dependencies
+# Install on GPU server only - requires CUDA 12.1+
+#
+# Usage:
+#   pip install -r backend/requirements.txt         # Base (all platforms)
+#   pip install -r backend/requirements-gpu.txt     # GPU (server only)
+#
+# After installing, compile CUDA kernels:
+#   bash scripts/setup_instant4d.sh
+
+# =============================================================================
+# PyTorch with CUDA 12.1
+# =============================================================================
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+
+# =============================================================================
+# Transformer/Attention Libraries
+# =============================================================================
+xformers>=0.0.26
+
+# =============================================================================
+# Pose Estimation (Stage 1)
+# =============================================================================
+# hloc for primary/fallback pose estimation
+hloc @ git+https://github.com/cvg/Hierarchical-Localization.git
+pycolmap>=0.6.0
+
+# DUSt3R for challenging videos
+dust3r @ git+https://github.com/naver/dust3r.git
+roma
+trimesh
+
+# =============================================================================
+# Object Segmentation (Stage 2)
+# =============================================================================
+segment-anything-2 @ git+https://github.com/facebookresearch/segment-anything-2.git
+
+# =============================================================================
+# Depth Estimation (for Instant4D)
+# =============================================================================
+unidepth
+
+# =============================================================================
+# Web Export (Stage 5)
+# =============================================================================
+3dgsconverter @ git+https://github.com/francescofugazzi/3dgsconverter.git
+
+# =============================================================================
+# CUDA Kernels
+# =============================================================================
+# These are installed separately via scripts/setup_instant4d.sh:
+#   - diff-gaussian-rasterization (from instant4d/)
+#   - pointops2 (from instant4d/submodule/)
+#   - simple-knn (from instant4d/submodule/)
+#   - fused-ssim (from instant4d/submodule/)
