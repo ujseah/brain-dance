@@ -1,3 +1,6 @@
 [submodule "versecrafter"]
 	path = versecrafter
 	url = https://github.com/TencentARC/VerseCrafter.git
+[submodule "instant4d"]
+	path = instant4d
+	url = https://github.com/Zhanpeng1202/Instant4D.git
