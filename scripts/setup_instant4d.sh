@@ -34,8 +34,9 @@ echo ""
 apply_python312_patches() {
     echo "[0/7] Applying Python 3.12+ compatibility patches..."
 
-    # Ensure setuptools is installed (distutils replacement)
-    pip install --quiet setuptools wheel
+    # Ensure setuptools, wheel, and ninja are installed
+    # ninja is required for JIT compilation of CUDA extensions
+    pip install --quiet setuptools wheel ninja
 
     # Fix 1: Create missing package directories and __init__.py files
     # These packages declare a Python package but don't include the directory in the repo
