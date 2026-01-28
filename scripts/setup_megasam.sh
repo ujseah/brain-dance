@@ -125,20 +125,24 @@ if [ -f "$RAFT_CKPT" ]; then
     echo "  Checkpoint already exists: $RAFT_CKPT"
 else
     echo "  Downloading raft-things.pth..."
-    # RAFT checkpoint from Google Drive (may require gdown)
+
+    # Try gdown first (may fail due to Google Drive rate limits)
     if command -v gdown &> /dev/null; then
-        gdown "https://drive.google.com/uc?id=1MqDajR89k-xLV0HIrmJ0k-n8ZpG6_NDA" -O "$RAFT_CKPT"
-    else
-        echo -e "${YELLOW}  gdown not installed. Installing...${NC}"
-        pip install gdown
-        gdown "https://drive.google.com/uc?id=1MqDajR89k-xLV0HIrmJ0k-n8ZpG6_NDA" -O "$RAFT_CKPT"
+        gdown --fuzzy "https://drive.google.com/file/d/1MqDajR89k-xLV0HIrmJ0k-n8ZpG6_NDA" -O "$RAFT_CKPT" 2>/dev/null || true
+    fi
+
+    # Fallback to Hugging Face mirror if gdown failed
+    if [ ! -f "$RAFT_CKPT" ]; then
+        echo "  gdown failed, trying Hugging Face mirror..."
+        wget -q --show-progress -O "$RAFT_CKPT" \
+            "https://huggingface.co/DeepBeepMeep/Wan2.1/resolve/main/flow/raft-things.pth"
     fi
 
     if [ -f "$RAFT_CKPT" ]; then
         echo -e "${GREEN}  RAFT checkpoint downloaded.${NC}"
     else
         echo -e "${YELLOW}  Could not download RAFT checkpoint automatically.${NC}"
-        echo "  Manual download from: https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT"
+        echo "  Manual download from: https://huggingface.co/DeepBeepMeep/Wan2.1/blob/main/flow/raft-things.pth"
     fi
 fi
 echo ""
