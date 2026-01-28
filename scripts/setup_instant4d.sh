@@ -37,9 +37,13 @@ apply_python312_patches() {
     # Ensure setuptools is installed (distutils replacement)
     pip install --quiet setuptools wheel
 
-    # Fix 1: Create missing __init__.py for diff-gaussian-rasterization
+    # Fix 1: Create missing package directory and __init__.py for diff-gaussian-rasterization
     DIFF_GAUSS_PKG="$INSTANT4D/diff-gaussian-rasterization/diff_gaussian_rasterization"
-    if [ -d "$DIFF_GAUSS_PKG" ] && [ ! -f "$DIFF_GAUSS_PKG/__init__.py" ]; then
+    if [ ! -d "$DIFF_GAUSS_PKG" ]; then
+        echo "  Creating missing package directory diff_gaussian_rasterization..."
+        mkdir -p "$DIFF_GAUSS_PKG"
+    fi
+    if [ ! -f "$DIFF_GAUSS_PKG/__init__.py" ]; then
         echo "  Creating missing __init__.py in diff_gaussian_rasterization..."
         touch "$DIFF_GAUSS_PKG/__init__.py"
     fi
