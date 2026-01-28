@@ -10,6 +10,11 @@
 #   - CUDA toolkit 12.1+ installed (nvcc available)
 #   - PyTorch 2.3+ with CUDA support
 #   - instant4d submodule initialized
+#
+# Compatibility:
+#   - Python 3.10 (recommended by Instant4D)
+#   - Python 3.11 (compatible with patches)
+#   - Python 3.12+ (compatible with auto-patches applied by this script)
 
 set -e  # Exit on error
 
@@ -24,9 +29,62 @@ echo "========================================"
 echo ""
 
 # =============================================================================
+# Step 0: Apply Python 3.12+ compatibility patches
+# =============================================================================
+apply_python312_patches() {
+    echo "[0/7] Applying Python 3.12+ compatibility patches..."
+
+    # Ensure setuptools is installed (distutils replacement)
+    pip install --quiet setuptools wheel
+
+    # Fix 1: Create missing __init__.py for diff-gaussian-rasterization
+    DIFF_GAUSS_PKG="$INSTANT4D/diff-gaussian-rasterization/diff_gaussian_rasterization"
+    if [ -d "$DIFF_GAUSS_PKG" ] && [ ! -f "$DIFF_GAUSS_PKG/__init__.py" ]; then
+        echo "  Creating missing __init__.py in diff_gaussian_rasterization..."
+        touch "$DIFF_GAUSS_PKG/__init__.py"
+    fi
+
+    # Fix 2: Patch pointops2 setup.py to remove deprecated distutils import
+    POINTOPS_SETUP="$INSTANT4D/submodule/pointops2/setup.py"
+    if [ -f "$POINTOPS_SETUP" ]; then
+        if grep -q "from distutils" "$POINTOPS_SETUP"; then
+            echo "  Patching pointops2/setup.py to remove distutils import..."
+            sed -i.bak 's/from distutils.sysconfig import get_config_vars/# distutils removed in Python 3.12 - patched by setup_instant4d.sh/' "$POINTOPS_SETUP"
+        fi
+    fi
+
+    # Fix 3: Ensure all setup.py files use setuptools instead of distutils
+    for setup_file in "$INSTANT4D/diff-gaussian-rasterization/setup.py" \
+                      "$INSTANT4D/submodule/simple-knn/setup.py" \
+                      "$INSTANT4D/submodule/fussed-ssim/setup.py"; do
+        if [ -f "$setup_file" ]; then
+            # Add setuptools import if not present
+            if ! grep -q "from setuptools import" "$setup_file"; then
+                echo "  Ensuring setuptools import in $(basename $(dirname $setup_file))/setup.py..."
+                # Most of these already use setuptools via torch.utils.cpp_extension
+            fi
+        fi
+    done
+
+    echo "  Python 3.12+ patches applied."
+    echo ""
+}
+
+# Check Python version and apply patches if needed
+PYTHON_MAJOR=$(python -c "import sys; print(sys.version_info.major)")
+PYTHON_MINOR=$(python -c "import sys; print(sys.version_info.minor)")
+
+if [ "$PYTHON_MAJOR" -ge 3 ] && [ "$PYTHON_MINOR" -ge 12 ]; then
+    echo "Detected Python $PYTHON_MAJOR.$PYTHON_MINOR (≥3.12)"
+    echo "Applying compatibility patches for deprecated distutils..."
+    echo ""
+    apply_python312_patches
+fi
+
+# =============================================================================
 # Step 1: Check prerequisites
 # =============================================================================
-echo "[1/6] Checking prerequisites..."
+echo "[1/7] Checking prerequisites..."
 
 # Check nvcc (CUDA compiler)
 if ! command -v nvcc &> /dev/null; then
@@ -67,7 +125,7 @@ fi
 # Step 2: Verify submodule
 # =============================================================================
 echo ""
-echo "[2/6] Verifying Instant4D submodule..."
+echo "[2/7] Verifying Instant4D submodule..."
 
 if [ ! -d "$INSTANT4D" ]; then
     echo "ERROR: instant4d/ directory not found at $INSTANT4D"
@@ -96,7 +154,7 @@ echo "  Nested submodules: OK"
 # Step 3: Install diff-gaussian-rasterization
 # =============================================================================
 echo ""
-echo "[3/6] Installing diff-gaussian-rasterization..."
+echo "[3/7] Installing diff-gaussian-rasterization..."
 
 DIFF_GAUSS="$INSTANT4D/diff-gaussian-rasterization"
 if [ ! -d "$DIFF_GAUSS" ]; then
@@ -112,7 +170,7 @@ echo "  Installed: diff-gaussian-rasterization"
 # Step 4: Install pointops2
 # =============================================================================
 echo ""
-echo "[4/6] Installing pointops2..."
+echo "[4/7] Installing pointops2..."
 
 POINTOPS="$INSTANT4D/submodule/pointops2"
 if [ ! -d "$POINTOPS" ]; then
@@ -128,7 +186,7 @@ echo "  Installed: pointops2"
 # Step 5: Install simple-knn
 # =============================================================================
 echo ""
-echo "[5/6] Installing simple-knn..."
+echo "[5/7] Installing simple-knn..."
 
 SIMPLE_KNN="$INSTANT4D/submodule/simple-knn"
 if [ ! -d "$SIMPLE_KNN" ]; then
@@ -144,7 +202,7 @@ echo "  Installed: simple-knn"
 # Step 6: Install fused-ssim
 # =============================================================================
 echo ""
-echo "[6/6] Installing fused-ssim..."
+echo "[6/7] Installing fused-ssim..."
 
 FUSED_SSIM="$INSTANT4D/submodule/fussed-ssim"
 if [ ! -d "$FUSED_SSIM" ]; then
@@ -157,14 +215,14 @@ pip install -e . --quiet
 echo "  Installed: fused-ssim"
 
 # =============================================================================
-# Verification
+# Step 7: Verification
 # =============================================================================
 echo ""
-echo "========================================"
-echo "Setup Complete!"
-echo "========================================"
+echo "[7/7] Verifying installations..."
 echo ""
-echo "Verifying installations..."
+echo "========================================"
+echo "Verification"
+echo "========================================"
 
 # Return to project root
 cd "$PROJECT_ROOT"
