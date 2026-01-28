@@ -257,11 +257,16 @@ class Instant4DAdapter:
         Converts Stage 1/2 outputs to Instant4D's filtered_cvd.npz format:
         - xyz: 3D point positions
         - rgb: Point colors
-        - prob_motion: Motion probability (from Stage 2 masks)
+        - prob_motion: Motion probability (from Stage 2 masks or Mega-SAM)
         - time_stamp: Temporal coordinate
         - scale_time: Temporal scale
         - intrinsic: Camera intrinsics
         - cam_c2w: Camera-to-world transforms
+
+        When Mega-SAM was used for pose estimation, the video_result metadata
+        may contain:
+        - depth_maps_dir: Path to dense depth maps (better initialization)
+        - motion_prob_path: Path to Mega-SAM's motion probability
 
         Args:
             video_result: Output from Stage 1 (frames + poses)
@@ -300,30 +305,51 @@ class Instant4DAdapter:
 
         # Step 4: Load or generate point cloud
         report(0.2, "Loading point cloud")
-        if video_result.sparse_points_path and Path(video_result.sparse_points_path).exists():
-            xyz, rgb = self._load_sparse_points(video_result.sparse_points_path)
-            report(0.3, f"Loaded {xyz.shape[0]} sparse points")
-        else:
-            xyz, rgb = self._generate_initial_points(
-                cam_c2w, intrinsic, num_frames, options.num_pts
-            )
-            report(0.3, f"Generated {xyz.shape[0]} initial points")
 
-        # Step 5: Compute motion probabilities from Stage 2 masks
+        # Check if Mega-SAM depth maps are available (preferred)
+        depth_maps_dir = video_result.metadata.get("depth_maps_dir")
+        if depth_maps_dir and Path(depth_maps_dir).exists():
+            try:
+                xyz, rgb = self._load_points_from_megasam_depth(
+                    depth_maps_dir, video_result.frames_dir, cam_c2w, intrinsic
+                )
+                report(0.3, f"Loaded {xyz.shape[0]} points from Mega-SAM depth")
+            except Exception as e:
+                logger.warning(f"Failed to load Mega-SAM depth: {e}, falling back to sparse")
+                xyz, rgb = self._load_or_generate_points(
+                    video_result, cam_c2w, intrinsic, num_frames, options
+                )
+                report(0.3, f"Loaded/generated {xyz.shape[0]} points (fallback)")
+        else:
+            xyz, rgb = self._load_or_generate_points(
+                video_result, cam_c2w, intrinsic, num_frames, options
+            )
+            report(0.3, f"Loaded/generated {xyz.shape[0]} points")
+
+        # Step 5: Compute motion probabilities
         report(0.4, "Computing motion probabilities")
-        if segmentation_result and segmentation_result.objects:
-            prob_motion = self._compute_motion_from_masks(
-                segmentation_result, xyz, frames, cam_c2w, intrinsic
+
+        # Check if Mega-SAM motion probability is available (preferred)
+        motion_prob_path = video_result.metadata.get("motion_prob_path")
+        if motion_prob_path and Path(motion_prob_path).exists():
+            try:
+                prob_motion = self._load_megasam_motion_prob(
+                    motion_prob_path, xyz, cam_c2w, intrinsic
+                )
+                num_dynamic = np.sum(prob_motion > options.motion_threshold)
+                report(0.5, f"Loaded Mega-SAM motion prob, {num_dynamic} dynamic points")
+            except Exception as e:
+                logger.warning(f"Failed to load Mega-SAM motion prob: {e}")
+                prob_motion = self._compute_motion_fallback(
+                    segmentation_result, xyz, frames, cam_c2w, intrinsic, options
+                )
+                report(0.5, "Motion probability computed (fallback)")
+        else:
+            prob_motion = self._compute_motion_fallback(
+                segmentation_result, xyz, frames, cam_c2w, intrinsic, options
             )
             num_dynamic = np.sum(prob_motion > options.motion_threshold)
-            report(0.5, f"Found {num_dynamic} dynamic points")
-        else:
-            # No segmentation - assume all static
-            prob_motion = np.zeros(xyz.shape[0], dtype=np.float32)
-            logger.warning(
-                "No segmentation data provided. Assuming all points are static."
-            )
-            report(0.5, "No segmentation data - assuming all static")
+            report(0.5, f"Motion probability computed, {num_dynamic} dynamic points")
 
         # Step 6: Assign timestamps to points
         report(0.55, "Assigning temporal coordinates")
@@ -855,6 +881,213 @@ class Instant4DAdapter:
         rgb = np.random.rand(num_pts, 3).astype(np.float32)
 
         return xyz.astype(np.float32), rgb
+
+    def _load_or_generate_points(
+        self,
+        video_result: "VideoProcessingResult",
+        cam_c2w: np.ndarray,
+        intrinsic: np.ndarray,
+        num_frames: int,
+        options: Instant4DOptions,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Load sparse points or generate initial points."""
+        if video_result.sparse_points_path and Path(video_result.sparse_points_path).exists():
+            return self._load_sparse_points(video_result.sparse_points_path)
+        else:
+            return self._generate_initial_points(
+                cam_c2w, intrinsic, num_frames, options.num_pts
+            )
+
+    def _load_points_from_megasam_depth(
+        self,
+        depth_maps_dir: str,
+        frames_dir: str,
+        cam_c2w: np.ndarray,
+        intrinsic: np.ndarray,
+        subsample_rate: int = 3,
+        max_points: int = 200_000,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load point cloud from Mega-SAM depth maps via back-projection.
+
+        Args:
+            depth_maps_dir: Directory containing depth NPZ files
+            frames_dir: Directory containing frame images
+            cam_c2w: (N, 4, 4) camera-to-world matrices
+            intrinsic: (3, 3) camera intrinsic matrix
+            subsample_rate: Subsample every N-th frame to reduce points
+            max_points: Maximum points to return
+
+        Returns:
+            xyz: (M, 3) point coordinates
+            rgb: (M, 3) point colors [0-1]
+        """
+        import cv2
+        from glob import glob
+
+        # Find depth file
+        depth_files = sorted(glob(f"{depth_maps_dir}/*_droid.npz"))
+        if not depth_files:
+            raise FileNotFoundError(f"No Mega-SAM depth files in {depth_maps_dir}")
+
+        # Load the NPZ file
+        data = np.load(depth_files[0])
+        depths = data["depths"]  # (N, H, W)
+        images = data.get("images")  # (N, H, W, 3) or None
+
+        all_xyz = []
+        all_rgb = []
+
+        # Subsample frames
+        frame_indices = list(range(0, depths.shape[0], subsample_rate))
+
+        for idx in frame_indices:
+            depth = depths[idx]
+            H, W = depth.shape
+
+            # Create pixel grid
+            u, v = np.meshgrid(np.arange(W), np.arange(H))
+            u = u.flatten() + 0.5
+            v = v.flatten() + 0.5
+            z = depth.flatten()
+
+            # Filter valid depths
+            valid = (z > 0.01) & (z < 100.0) & np.isfinite(z)
+
+            # Subsample pixels
+            valid_indices = np.where(valid)[0]
+            if len(valid_indices) > max_points // len(frame_indices):
+                valid_indices = np.random.choice(
+                    valid_indices,
+                    max_points // len(frame_indices),
+                    replace=False
+                )
+
+            u, v, z = u[valid_indices], v[valid_indices], z[valid_indices]
+
+            # Back-project to camera space
+            fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+            cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+            x = (u - cx) * z / fx
+            y = (v - cy) * z / fy
+            xyz_cam = np.stack([x, y, z], axis=1)
+
+            # Transform to world coordinates
+            if idx < cam_c2w.shape[0]:
+                c2w = cam_c2w[idx]
+                xyz_world = (c2w[:3, :3] @ xyz_cam.T + c2w[:3, 3:4]).T
+                all_xyz.append(xyz_world)
+
+                # Get colors if available
+                if images is not None:
+                    img = images[idx]
+                    pixel_u = np.clip(u.astype(int), 0, W - 1)
+                    pixel_v = np.clip(v.astype(int), 0, H - 1)
+                    colors = img[pixel_v, pixel_u] / 255.0
+                    all_rgb.append(colors)
+                else:
+                    all_rgb.append(np.ones((xyz_world.shape[0], 3)) * 0.5)
+
+        xyz = np.concatenate(all_xyz, axis=0).astype(np.float32)
+        rgb = np.concatenate(all_rgb, axis=0).astype(np.float32)
+
+        # Final subsampling if too many points
+        if xyz.shape[0] > max_points:
+            indices = np.random.choice(xyz.shape[0], max_points, replace=False)
+            xyz = xyz[indices]
+            rgb = rgb[indices]
+
+        logger.info(f"Loaded {xyz.shape[0]} points from Mega-SAM depth")
+        return xyz, rgb
+
+    def _load_megasam_motion_prob(
+        self,
+        motion_prob_path: str,
+        xyz: np.ndarray,
+        cam_c2w: np.ndarray,
+        intrinsic: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Load motion probability from Mega-SAM and interpolate to 3D points.
+
+        Mega-SAM provides per-pixel motion probability maps. We project 3D points
+        to the image and sample the motion probability.
+
+        Args:
+            motion_prob_path: Path to motion_prob.npy (N, H/8, W/8)
+            xyz: (M, 3) 3D point coordinates
+            cam_c2w: (N, 4, 4) camera-to-world matrices
+            intrinsic: (3, 3) camera intrinsics
+
+        Returns:
+            prob_motion: (M,) motion probability for each point
+        """
+        import cv2
+
+        motion_maps = np.load(motion_prob_path)  # (N, H/8, W/8)
+        num_points = xyz.shape[0]
+        motion_sum = np.zeros(num_points, dtype=np.float32)
+        visible_count = np.zeros(num_points, dtype=np.float32)
+
+        for frame_idx in range(min(motion_maps.shape[0], cam_c2w.shape[0])):
+            motion_map = motion_maps[frame_idx]  # (H/8, W/8)
+            h, w = motion_map.shape
+
+            # Get camera matrices
+            c2w = cam_c2w[frame_idx]
+            w2c = np.linalg.inv(c2w)
+
+            # Project 3D points to camera space
+            xyz_cam = (w2c[:3, :3] @ xyz.T + w2c[:3, 3:4]).T
+            z = xyz_cam[:, 2]
+            valid = z > 0.1
+
+            # Project to image (at 1/8 resolution)
+            uv = (intrinsic @ xyz_cam.T).T
+            uv = uv[:, :2] / (uv[:, 2:3] + 1e-8)
+            uv = uv / 8.0  # Scale to motion map resolution
+
+            # Sample motion probability
+            u = np.clip(uv[:, 0].astype(int), 0, w - 1)
+            v = np.clip(uv[:, 1].astype(int), 0, h - 1)
+
+            motion_values = motion_map[v, u]
+
+            # Accumulate for visible points
+            motion_sum[valid] += motion_values[valid]
+            visible_count[valid] += 1
+
+        # Average motion probability
+        prob_motion = np.zeros(num_points, dtype=np.float32)
+        has_observations = visible_count > 0
+        prob_motion[has_observations] = motion_sum[has_observations] / visible_count[has_observations]
+
+        logger.info(
+            f"Loaded Mega-SAM motion prob: "
+            f"{np.sum(prob_motion > 0.5)} dynamic, {np.sum(prob_motion <= 0.5)} static points"
+        )
+        return prob_motion
+
+    def _compute_motion_fallback(
+        self,
+        segmentation_result: Optional["ObjectSegmentationResult"],
+        xyz: np.ndarray,
+        frames: List[Dict[str, Any]],
+        cam_c2w: np.ndarray,
+        intrinsic: np.ndarray,
+        options: Instant4DOptions,
+    ) -> np.ndarray:
+        """Compute motion probability using SAM-2 masks or assume static."""
+        if segmentation_result and segmentation_result.objects:
+            return self._compute_motion_from_masks(
+                segmentation_result, xyz, frames, cam_c2w, intrinsic
+            )
+        else:
+            logger.warning(
+                "No segmentation or Mega-SAM motion data. Assuming all points static."
+            )
+            return np.zeros(xyz.shape[0], dtype=np.float32)
 
     def _compute_motion_from_masks(
         self,
