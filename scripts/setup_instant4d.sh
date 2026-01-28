@@ -37,7 +37,10 @@ apply_python312_patches() {
     # Ensure setuptools is installed (distutils replacement)
     pip install --quiet setuptools wheel
 
-    # Fix 1: Create missing package directory and __init__.py for diff-gaussian-rasterization
+    # Fix 1: Create missing package directories and __init__.py files
+    # These packages declare a Python package but don't include the directory in the repo
+
+    # diff-gaussian-rasterization
     DIFF_GAUSS_PKG="$INSTANT4D/diff-gaussian-rasterization/diff_gaussian_rasterization"
     if [ ! -d "$DIFF_GAUSS_PKG" ]; then
         echo "  Creating missing package directory diff_gaussian_rasterization..."
@@ -46,6 +49,17 @@ apply_python312_patches() {
     if [ ! -f "$DIFF_GAUSS_PKG/__init__.py" ]; then
         echo "  Creating missing __init__.py in diff_gaussian_rasterization..."
         touch "$DIFF_GAUSS_PKG/__init__.py"
+    fi
+
+    # simple-knn
+    SIMPLE_KNN_PKG="$INSTANT4D/submodule/simple-knn/simple_knn"
+    if [ ! -d "$SIMPLE_KNN_PKG" ]; then
+        echo "  Creating missing package directory simple_knn..."
+        mkdir -p "$SIMPLE_KNN_PKG"
+    fi
+    if [ ! -f "$SIMPLE_KNN_PKG/__init__.py" ]; then
+        echo "  Creating missing __init__.py in simple_knn..."
+        touch "$SIMPLE_KNN_PKG/__init__.py"
     fi
 
     # Fix 2: Patch pointops2 setup.py to remove deprecated distutils import
