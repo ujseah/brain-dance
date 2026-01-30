@@ -299,11 +299,16 @@ class MegaSamPoseEstimator:
                     image = cv2.imread(str(img_path))
                     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-                    # Run inference
-                    predictions = model.infer(image_rgb)
+                    # Run inference — UniDepthV2 expects a CHW float tensor
+                    rgb_torch = torch.from_numpy(image_rgb).permute(2, 0, 1).float().to(device)
+                    predictions = model.infer(rgb_torch)
 
                     depth = predictions["depth"].cpu().numpy().squeeze()
-                    fov = predictions.get("fov", torch.tensor([60.0])).cpu().numpy().item()
+                    # UniDepthV2 returns intrinsics, not fov — compute FOV from focal length
+                    intrinsics = predictions["intrinsics"]
+                    fx = intrinsics[0, 0, 0].cpu().item()
+                    w = predictions["depth"].shape[-1]
+                    fov = float(np.rad2deg(2 * np.arctan(w / (2 * fx))))
 
                     fovs.append(fov)
 
