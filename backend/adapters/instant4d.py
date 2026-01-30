@@ -1252,41 +1252,39 @@ class Instant4DAdapter:
         dynamic_mask = prob_motion > options.motion_threshold
         static_mask = ~dynamic_mask
 
-        filtered_indices = []
+        results = []  # list of (xyz, rgb, prob, time, scale) tuples
 
         # Filter static points
         if np.any(static_mask):
             voxel_size = mean_depth / focal * options.static_voxel_scale
-            static_xyz = xyz[static_mask]
-            static_indices = np.where(static_mask)[0]
-
-            # Downsample
-            _, indices = pcu.downsample_point_cloud_voxel_grid(
-                voxel_size, static_xyz, return_indices=True
+            s_xyz, s_rgb, s_prob, s_time, s_scale = pcu.downsample_point_cloud_on_voxel_grid(
+                voxel_size,
+                xyz[static_mask],
+                rgb[static_mask],
+                prob_motion[static_mask],
+                time_stamp[static_mask],
+                scale_time[static_mask],
             )
-            filtered_indices.extend(static_indices[indices])
+            results.append((s_xyz, s_rgb, s_prob, s_time, s_scale))
 
         # Filter dynamic points
         if np.any(dynamic_mask):
             voxel_size = mean_depth / focal * options.dynamic_voxel_scale
-            dynamic_xyz = xyz[dynamic_mask]
-            dynamic_indices = np.where(dynamic_mask)[0]
-
-            # Downsample
-            _, indices = pcu.downsample_point_cloud_voxel_grid(
-                voxel_size, dynamic_xyz, return_indices=True
+            d_xyz, d_rgb, d_prob, d_time, d_scale = pcu.downsample_point_cloud_on_voxel_grid(
+                voxel_size,
+                xyz[dynamic_mask],
+                rgb[dynamic_mask],
+                prob_motion[dynamic_mask],
+                time_stamp[dynamic_mask],
+                scale_time[dynamic_mask],
             )
-            filtered_indices.extend(dynamic_indices[indices])
+            results.append((d_xyz, d_rgb, d_prob, d_time, d_scale))
 
-        # Apply filter
-        filtered_indices = np.array(filtered_indices)
-        return (
-            xyz[filtered_indices],
-            rgb[filtered_indices],
-            prob_motion[filtered_indices],
-            time_stamp[filtered_indices],
-            scale_time[filtered_indices],
-        )
+        if not results:
+            return xyz, rgb, prob_motion, time_stamp, scale_time
+
+        # Concatenate static + dynamic results
+        return tuple(np.concatenate([r[i] for r in results], axis=0) for i in range(5))
 
     def _create_instant4d_transforms(
         self,
@@ -1333,7 +1331,7 @@ class Instant4DAdapter:
         """Build Instant4D training configuration objects."""
         from argparse import Namespace
 
-        # Model parameters
+        # Model parameters (must match Instant4D's ModelParams defaults)
         model_params = Namespace(
             source_path=preprocessed_dir,
             model_path=str(output_path),
@@ -1343,6 +1341,11 @@ class Instant4DAdapter:
             white_background=False,
             data_device="cuda",
             eval=False,
+            extension=".png",
+            num_extra_pts=0,
+            loaded_pth="",
+            frame_ratio=1,
+            dataloader=False,
         )
 
         # Optimization parameters
