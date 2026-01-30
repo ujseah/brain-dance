@@ -669,7 +669,7 @@ class Instant4DAdapter:
     def run_full_pipeline(
         self,
         video_result: "VideoProcessingResult",
-        segmentation_result: Optional["ObjectSegmentationResult"],
+        segmentation_result: Optional["ObjectSegmentationResult"] = None,
         output_dir: str,
         options: Optional[Instant4DOptions] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
