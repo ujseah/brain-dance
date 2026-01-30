@@ -365,6 +365,7 @@ class MegaSamPoseEstimator:
             encoder='vitl',
             features=256,
             out_channels=[256, 512, 1024, 1024],
+            localhub=False,  # Download DINOv2 backbone from GitHub (no local cache on Colab)
         )
         model.load_state_dict(
             torch.load(str(self.DEPTH_ANYTHING_WEIGHTS), map_location='cpu'),
@@ -909,7 +910,7 @@ class VideoProcessingStage:
                 try:
                     self._run_hloc_pipeline(frames_dir, transforms_path, sparse_path)
                     report(0.9, "hloc pipeline completed (fallback)")
-                except RuntimeError as e2:
+                except (RuntimeError, ImportError) as e2:
                     # Further cascade to DUSt3R
                     logger.warning(f"hloc pipeline also failed: {e2}")
                     report(0.7, "Falling back to DUSt3R...")
