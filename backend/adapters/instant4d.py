@@ -488,16 +488,17 @@ class Instant4DAdapter:
         report(0.15, f"Starting training ({total_iterations} iterations)")
 
         for iteration in range(1, total_iterations + 1):
-            # Sample training view
+            # Sample training view — CameraDataset.__getitem__ returns (image, camera)
             camera_idx = iteration % len(training_cameras)
-            viewpoint = training_cameras[camera_idx]
+            gt_image, viewpoint = training_cameras[camera_idx]
+
+            # Move to GPU
+            gt_image = gt_image.cuda()
+            viewpoint = viewpoint.cuda()
 
             # Render
             render_pkg = render(viewpoint, gaussians, pipe_params, bg_color)
             image = render_pkg["render"]
-
-            # Get ground truth
-            gt_image = viewpoint.original_image.cuda()
 
             # Compute loss
             loss = self._compute_loss(image, gt_image)
