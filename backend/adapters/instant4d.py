@@ -38,7 +38,7 @@ class Instant4DOptions:
     """Options for Instant4D 4D Gaussian training."""
 
     # Training parameters
-    iterations: int = 5000
+    iterations: int = 10_000
     """Number of optimization iterations."""
 
     batch_size: int = 1
@@ -488,6 +488,9 @@ class Instant4DAdapter:
         report(0.15, f"Starting training ({total_iterations} iterations)")
 
         for iteration in range(1, total_iterations + 1):
+            # Update learning rate (exponential decay for position params)
+            gaussians.update_learning_rate(iteration)
+
             # Sample training view — CameraDataset.__getitem__ returns (image, camera)
             camera_idx = iteration % len(training_cameras)
             gt_image, viewpoint = training_cameras[camera_idx]
