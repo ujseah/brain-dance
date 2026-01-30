@@ -1294,6 +1294,11 @@ class Instant4DAdapter:
         num_frames: int,
     ) -> None:
         """Create transforms_train.json and transforms_test.json for Instant4D."""
+        # Symlink Stage 1 frames into preprocessed directory so Instant4D can find them
+        frames_link = output_path / "frames"
+        if not frames_link.exists():
+            frames_link.symlink_to(Path(frames_dir).resolve())
+
         frames = transforms["frames"]
 
         # Split 90/10 train/test
