@@ -198,15 +198,23 @@ class Instant4DAdapter:
         logger.info(f"Instant4D found at {self.INSTANT4D_PATH}")
 
     def _add_instant4d_to_path(self) -> None:
-        """Add Instant4D to Python path for imports."""
+        """Add Instant4D and submodule paths for imports."""
         if self._path_added:
             return
 
-        instant4d_str = str(self.INSTANT4D_PATH)
-        if instant4d_str not in sys.path:
-            sys.path.insert(0, instant4d_str)
-            self._path_added = True
-            logger.debug(f"Added {instant4d_str} to Python path")
+        paths = [
+            self.INSTANT4D_PATH,
+            self.INSTANT4D_PATH / "submodule" / "fussed-ssim",
+            self.INSTANT4D_PATH / "submodule",
+            self.INSTANT4D_PATH / "submodule" / "pointops2",
+            self.INSTANT4D_PATH / "submodule" / "simple-knn",
+        ]
+        for p in paths:
+            p_str = str(p)
+            if p_str not in sys.path:
+                sys.path.insert(0, p_str)
+        self._path_added = True
+        logger.debug(f"Added Instant4D paths to Python path")
 
     def _validate_cuda_kernels(self) -> None:
         """
@@ -218,7 +226,7 @@ class Instant4DAdapter:
         self._add_instant4d_to_path()
 
         try:
-            from diff_gaussian_rasterization import GaussianRasterizer
+            from gaussian_renderer import GaussianRasterizer
 
             assert GaussianRasterizer is not None
         except ImportError as e:
@@ -228,7 +236,7 @@ class Instant4DAdapter:
             ) from e
 
         try:
-            from simple_knn import distCUDA2
+            from simple_knn._C import distCUDA2
 
             assert distCUDA2 is not None
         except ImportError as e:
@@ -669,8 +677,8 @@ class Instant4DAdapter:
     def run_full_pipeline(
         self,
         video_result: "VideoProcessingResult",
-        segmentation_result: Optional["ObjectSegmentationResult"] = None,
         output_dir: str,
+        segmentation_result: Optional["ObjectSegmentationResult"] = None,
         options: Optional[Instant4DOptions] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> Instant4DResult:
