@@ -525,8 +525,16 @@ class Instant4DAdapter:
                     gaussians.max_radii2D[render_pkg["visibility_filter"]],
                     render_pkg["radii"][render_pkg["visibility_filter"]],
                 )
+
+                # Compute temporal gradient for 4D Gaussians
+                t_grad = None
+                if gaussians.gaussian_dim == 4:
+                    t_grad = gaussians._t.grad.clone().detach()
+
                 gaussians.add_densification_stats(
-                    render_pkg["viewspace_points"], render_pkg["visibility_filter"]
+                    render_pkg["viewspace_points"],
+                    render_pkg["visibility_filter"],
+                    t_grad,
                 )
 
                 if (
@@ -541,6 +549,7 @@ class Instant4DAdapter:
                         opt_params.thresh_opa_prune,
                         scene.cameras_extent,
                         size_threshold,
+                        opt_params.densify_grad_t_threshold,
                     )
 
         # Save checkpoint
