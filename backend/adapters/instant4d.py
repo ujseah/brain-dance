@@ -504,10 +504,6 @@ class Instant4DAdapter:
             loss = self._compute_loss(image, gt_image)
             loss.backward()
 
-            # Optimizer step
-            gaussians.optimizer.step()
-            gaussians.optimizer.zero_grad(set_to_none=True)
-
             # Track metrics
             with torch.no_grad():
                 psnr = self._compute_psnr(image, gt_image)
@@ -519,7 +515,7 @@ class Instant4DAdapter:
                 pct = 0.15 + 0.75 * (iteration / total_iterations)
                 report(pct, f"Iteration {iteration}/{total_iterations}, PSNR: {psnr:.2f}")
 
-            # Densification and pruning
+            # Densification and pruning (must read gradients before zero_grad)
             if iteration < opt_params.densify_until_iter:
                 gaussians.max_radii2D[render_pkg["visibility_filter"]] = torch.max(
                     gaussians.max_radii2D[render_pkg["visibility_filter"]],
@@ -551,6 +547,10 @@ class Instant4DAdapter:
                         size_threshold,
                         opt_params.densify_grad_t_threshold,
                     )
+
+            # Optimizer step (after densification reads gradients)
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
 
         # Save checkpoint
         report(0.92, "Saving model checkpoint")
