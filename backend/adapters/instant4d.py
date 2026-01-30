@@ -1353,10 +1353,11 @@ class Instant4DAdapter:
             dataloader=False,
         )
 
-        # Optimization parameters
+        # Optimization parameters (must match Instant4D's OptimizationParams defaults)
         opt_params = Namespace(
             iterations=options.iterations,
             position_lr_init=0.00016,
+            position_t_lr_init=-1.0,  # <0 means fallback to position_lr_init
             position_lr_final=0.0000016,
             position_lr_delay_mult=0.01,
             position_lr_max_steps=30000,
@@ -1367,11 +1368,18 @@ class Instant4DAdapter:
             densify_from_iter=500,
             densify_until_iter=min(15000, options.iterations),
             densify_grad_threshold=0.0002,
+            densify_grad_t_threshold=0.000005,
             densification_interval=100,
             opacity_reset_interval=3000,
+            densify_until_num_points=-1,
+            final_prune_from_iter=-1,
+            sh_increase_interval=1000,
             thresh_opa_prune=0.005,
             percent_dense=0.01,
             lambda_dssim=0.2,
+            lambda_opa_mask=0.0,
+            lambda_rigid=0.0,
+            lambda_motion=0.0,
         )
 
         # Pipeline parameters
