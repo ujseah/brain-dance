@@ -1388,6 +1388,10 @@ class Instant4DAdapter:
             convert_SHs_python=False,
             compute_cov3D_python=False,
             debug=False,
+            env_map_res=0,
+            env_optimize_until=1000000000,
+            env_optimize_from=0,
+            eval_shfs_4d=False,
         )
 
         return model_params, opt_params, pipe_params
