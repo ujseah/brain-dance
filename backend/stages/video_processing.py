@@ -350,7 +350,7 @@ class MegaSamPoseEstimator:
             if str(da_path) not in sys.path:
                 sys.path.insert(0, str(da_path))
 
-            from depth_anything.dpt import DepthAnything
+            from depth_anything.dpt import DPT_DINOv2
             from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
             from torchvision.transforms import Compose
         except ImportError:
@@ -360,10 +360,17 @@ class MegaSamPoseEstimator:
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load model
-        model = DepthAnything.from_pretrained(
-            "LiheYoung/depth-anything-large-hf"
-        ).to(device).eval()
+        # Load model — vitl encoder with local checkpoint (not HuggingFace)
+        model = DPT_DINOv2(
+            encoder='vitl',
+            features=256,
+            out_channels=[256, 512, 1024, 1024],
+        )
+        model.load_state_dict(
+            torch.load(str(self.DEPTH_ANYTHING_WEIGHTS), map_location='cpu'),
+            strict=True,
+        )
+        model = model.to(device).eval()
 
         # Setup transforms
         transform = Compose([
