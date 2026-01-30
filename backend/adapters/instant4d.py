@@ -1341,7 +1341,7 @@ class Instant4DAdapter:
             white_background=False,
             data_device="cuda",
             eval=False,
-            extension=".png",
+            extension="",  # file_path in transforms JSON already includes extension
             num_extra_pts=0,
             loaded_pth="",
             frame_ratio=1,
