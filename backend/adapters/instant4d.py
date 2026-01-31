@@ -1541,16 +1541,19 @@ class Instant4DAdapter:
         from gaussian_renderer import render
 
         test_cameras = scene.getTestCameras()
-        if not test_cameras:
+        if len(test_cameras) == 0:
             return {"psnr": 0.0, "ssim": 0.0, "num_test_views": 0}
 
         psnr_values = []
+        num_eval = min(5, len(test_cameras))
 
         with torch.no_grad():
-            for viewpoint in test_cameras[:5]:  # Limit to 5 test views
+            for i in range(num_eval):
+                gt_image, viewpoint = test_cameras[i]
+                viewpoint = viewpoint.cuda()
                 render_pkg = render(viewpoint, gaussians, pipe_params, bg_color)
                 image = render_pkg["render"]
-                gt_image = viewpoint.original_image.cuda()
+                gt_image = gt_image.cuda()
                 psnr = self._compute_psnr(image, gt_image)
                 psnr_values.append(psnr)
 
