@@ -873,8 +873,10 @@ class Instant4DAdapter:
             if test_dir.exists():
                 video_files = sorted(
                     f
-                    for f in test_dir.glob("novel_view_*.mp4")
-                    if f.stat().st_size > 0
+                    for f in test_dir.iterdir()
+                    if f.name.startswith("novel_view_")
+                    and f.suffix in (".mp4", ".avi")
+                    and f.stat().st_size > 0
                 )
             else:
                 video_files = []
