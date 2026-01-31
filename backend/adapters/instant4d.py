@@ -838,9 +838,10 @@ class Instant4DAdapter:
 
         try:
             logger.info("Rendering preview video (quality check)")
-            scene.render_evaluate_sora(
-                str(output_path), gaussians, pipe_params, bg_color
-            )
+            with torch.no_grad():
+                scene.render_evaluate_sora(
+                    str(output_path), gaussians, pipe_params, bg_color
+                )
 
             # Find the generated video (render_evaluate_sora writes to test/ subdir)
             test_dir = output_path / "test"
