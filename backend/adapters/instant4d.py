@@ -488,6 +488,10 @@ class Instant4DAdapter:
         total_iterations = options.iterations
         metrics_history = {"psnr": [], "loss": []}
 
+        logger.info(
+            f"Scene cameras_extent={scene.cameras_extent:.4f}, "
+            f"initial gaussians={gaussians.get_xyz.shape[0]}"
+        )
         report(0.15, f"Starting training ({total_iterations} iterations)")
 
         for iteration in range(1, total_iterations + 1):
@@ -546,6 +550,7 @@ class Instant4DAdapter:
                     size_threshold = (
                         20 if iteration > opt_params.opacity_reset_interval else None
                     )
+                    before_count = gaussians.get_xyz.shape[0]
                     gaussians.densify_and_prune(
                         opt_params.densify_grad_threshold,
                         opt_params.thresh_opa_prune,
@@ -553,6 +558,13 @@ class Instant4DAdapter:
                         size_threshold,
                         opt_params.densify_grad_t_threshold,
                     )
+                    after_count = gaussians.get_xyz.shape[0]
+                    if iteration % 500 == 0 or abs(after_count - before_count) > 1000:
+                        logger.info(
+                            f"Iter {iteration}: gaussians {before_count} -> "
+                            f"{after_count}, extent={scene.cameras_extent:.4f}, "
+                            f"size_thresh={size_threshold}"
+                        )
 
             # Optimizer step (after densification reads gradients)
             gaussians.optimizer.step()
@@ -837,6 +849,17 @@ class Instant4DAdapter:
         output_path.mkdir(parents=True, exist_ok=True)
 
         try:
+            # Log OpenCV codec availability for diagnostics
+            try:
+                import cv2
+
+                logger.info(
+                    f"OpenCV {cv2.__version__}, "
+                    f"FFMPEG: {'yes' if 'FFMPEG' in cv2.getBuildInformation() else 'no'}"
+                )
+            except Exception:
+                pass
+
             logger.info("Rendering preview video (quality check)")
             with torch.no_grad():
                 scene.render_evaluate_sora(
@@ -844,15 +867,31 @@ class Instant4DAdapter:
                 )
 
             # Find the generated video (render_evaluate_sora writes to test/ subdir)
+            # Filter to nonzero-size files — cv2.VideoWriter silently creates empty
+            # files when the codec (avc1/H.264) isn't available on the platform.
             test_dir = output_path / "test"
-            video_files = sorted(test_dir.glob("novel_view_*.mp4")) if test_dir.exists() else []
+            if test_dir.exists():
+                video_files = sorted(
+                    f
+                    for f in test_dir.glob("novel_view_*.mp4")
+                    if f.stat().st_size > 0
+                )
+            else:
+                video_files = []
 
             if video_files:
-                video_path = str(video_files[0])
-                logger.info(f"Preview video saved: {video_path}")
+                video_path = str(video_files[-1])  # last variant (largest wobble)
+                logger.info(
+                    f"Preview video saved: {video_path} "
+                    f"({len(video_files)} variant(s))"
+                )
                 return video_path
             else:
-                logger.warning("render_evaluate_sora completed but no video file found")
+                logger.warning(
+                    "render_evaluate_sora completed but no valid video file found "
+                    "(H.264 codec may not be available — "
+                    "try: pip install opencv-python-headless)"
+                )
                 return None
         except Exception as e:
             logger.warning(f"Preview video rendering failed: {e}")
