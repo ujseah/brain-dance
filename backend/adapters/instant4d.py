@@ -396,7 +396,7 @@ class Instant4DAdapter:
         # Step 9: Create transforms_train.json and transforms_test.json
         report(0.9, "Creating Instant4D transforms")
         self._create_instant4d_transforms(
-            transforms, video_result.frames_dir, output_path, num_frames
+            transforms, video_result.frames_dir, output_path, num_frames, cam_c2w
         )
 
         report(1.0, "Preprocessing complete")
@@ -465,6 +465,7 @@ class Instant4DAdapter:
             time_duration=list(options.time_duration),
             rot_4d=options.rot_4d,
             force_sh_3d=False,
+            sh_degree_t=2,  # Temporal SH (matches upstream eval_shfs_4d=True)
         )
 
         # Load scene
@@ -1488,8 +1489,21 @@ class Instant4DAdapter:
         frames_dir: str,
         output_path: Path,
         num_frames: int,
+        cam_c2w: "np.ndarray",
     ) -> None:
-        """Create transforms_train.json and transforms_test.json for Instant4D."""
+        """Create transforms_train.json and transforms_test.json for Instant4D.
+
+        Args:
+            transforms: Original Stage 1 transforms (used for intrinsics and file_path)
+            frames_dir: Path to frame images
+            output_path: Output directory
+            num_frames: Number of frames
+            cam_c2w: (N, 4, 4) camera-to-world matrices in COLMAP convention.
+                Instant4D's readCamerasFromCutter expects COLMAP convention
+                (the OpenGL→COLMAP flip at line 377 is commented out).
+                The point cloud in filtered_cvd.npz is also in COLMAP world
+                space, so cameras and points must use the same convention.
+        """
         # Symlink Stage 1 frames into preprocessed directory so Instant4D can find them
         frames_link = output_path / "frames"
         if not frames_link.exists():
@@ -1502,9 +1516,13 @@ class Instant4DAdapter:
         train_frames = frames[:train_count]
         test_frames = frames[train_count:]
 
-        # Add timestamp to each frame
+        # Add timestamp and overwrite transform_matrix with COLMAP-convention poses.
+        # The original transforms from Stage 1 are in OpenGL convention, but
+        # Instant4D's reader expects COLMAP convention (Y-down, Z-forward).
         for i, frame in enumerate(frames):
             frame["time"] = i / max(1, num_frames - 1) * 3.0  # Normalize to [0, 3]
+            if i < cam_c2w.shape[0]:
+                frame["transform_matrix"] = cam_c2w[i].tolist()
 
         # Create base structure
         base = {
@@ -1586,7 +1604,7 @@ class Instant4DAdapter:
             env_map_res=0,
             env_optimize_until=1000000000,
             env_optimize_from=0,
-            eval_shfs_4d=False,
+            eval_shfs_4d=True,
         )
 
         return model_params, opt_params, pipe_params

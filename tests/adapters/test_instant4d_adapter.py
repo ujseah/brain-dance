@@ -442,8 +442,9 @@ class TestFormatConversion:
             output_path.mkdir()
 
             # Create Instant4D transforms
+            cam_c2w = np.stack([np.eye(4) for _ in range(10)])
             adapter._create_instant4d_transforms(
-                mock_transforms, str(input_path / "frames"), output_path, 10
+                mock_transforms, str(input_path / "frames"), output_path, 10, cam_c2w
             )
 
             # Verify train and test transforms exist
@@ -473,8 +474,9 @@ class TestFormatConversion:
             output_path = tmp_path / "output"
             output_path.mkdir()
 
+            cam_c2w = np.stack([np.eye(4) for _ in range(10)])
             adapter._create_instant4d_transforms(
-                mock_transforms, str(tmp_path / "frames"), output_path, 10
+                mock_transforms, str(tmp_path / "frames"), output_path, 10, cam_c2w
             )
 
             with open(output_path / "transforms_train.json") as f:
