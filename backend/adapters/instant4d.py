@@ -849,10 +849,11 @@ class Instant4DAdapter:
         output_path.mkdir(parents=True, exist_ok=True)
 
         try:
+            import cv2
+            import os as _os
+
             # Log OpenCV codec availability for diagnostics
             try:
-                import cv2
-
                 logger.info(
                     f"OpenCV {cv2.__version__}, "
                     f"FFMPEG: {'yes' if 'FFMPEG' in cv2.getBuildInformation() else 'no'}"
@@ -860,11 +861,56 @@ class Instant4DAdapter:
             except Exception:
                 pass
 
-            logger.info("Rendering preview video (quality check)")
-            with torch.no_grad():
-                scene.render_evaluate_sora(
-                    str(output_path), gaussians, pipe_params, bg_color
-                )
+            # Monkey-patch cv2.VideoWriter with codec fallback.
+            # render_evaluate_sora (in the instant4d submodule) hard-codes
+            # avc1 (H.264), which silently fails on Colab. Since the
+            # submodule isn't updated by git pull, we patch cv2.VideoWriter
+            # here so the submodule code picks up the fallback automatically.
+            _OriginalVideoWriter = cv2.VideoWriter
+            _CODECS = [("avc1", ".mp4"), ("mp4v", ".mp4"), ("XVID", ".avi")]
+
+            class _FallbackVideoWriter:
+                """cv2.VideoWriter wrapper that tries multiple codecs."""
+
+                def __init__(self, filename, fourcc, fps, frameSize, isColor=True):
+                    self._writer = None
+                    self._path = filename
+                    base, _ = _os.path.splitext(filename)
+                    for codec, ext in _CODECS:
+                        try_path = base + ext
+                        fc = cv2.VideoWriter_fourcc(*codec)
+                        w = _OriginalVideoWriter(
+                            try_path, fc, fps, frameSize, isColor
+                        )
+                        if w.isOpened():
+                            self._writer = w
+                            self._path = try_path
+                            logger.info(f"VideoWriter using codec: {codec}")
+                            break
+                        w.release()
+                    if self._writer is None:
+                        logger.warning("No working video codec found")
+                        self._writer = _OriginalVideoWriter()
+
+                def isOpened(self):
+                    return self._writer.isOpened()
+
+                def write(self, frame):
+                    return self._writer.write(frame)
+
+                def release(self):
+                    return self._writer.release()
+
+            cv2.VideoWriter = _FallbackVideoWriter
+
+            try:
+                logger.info("Rendering preview video (quality check)")
+                with torch.no_grad():
+                    scene.render_evaluate_sora(
+                        str(output_path), gaussians, pipe_params, bg_color
+                    )
+            finally:
+                cv2.VideoWriter = _OriginalVideoWriter
 
             # Find the generated video (render_evaluate_sora writes to test/ subdir)
             # Filter to nonzero-size files — cv2.VideoWriter silently creates empty
