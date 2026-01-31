@@ -104,7 +104,10 @@ class Instant4DResult:
     """Path to training configuration used."""
 
     preview_video_path: Optional[str] = None
-    """Path to rendered preview video (quality check)."""
+    """Path to rendered preview video (frozen-moment wobble diagnostic)."""
+
+    temporal_replay_path: Optional[str] = None
+    """Path to temporal replay video (4D scene evolution over time)."""
 
     temporal_metadata: Dict[str, Any] = field(default_factory=dict)
     """Temporal metadata (fps, duration, timestamps)."""
@@ -787,14 +790,26 @@ class Instant4DAdapter:
             ),
         }
 
-        # Phase 4: Preview video (95-100%) — quality check
-        report(0.95, "Phase 4: Rendering preview video (quality check)")
-        preview_path = self.render_preview_video(str(output_path / "preview"))
+        # Phase 4: Preview videos (95-100%)
+        preview_dir = str(output_path / "preview")
+
+        report(0.95, "Phase 4a: Rendering diagnostic wobble video")
+        preview_path = self.render_preview_video(preview_dir)
         if preview_path:
             result.preview_video_path = preview_path
-            report(0.98, f"Preview video: {preview_path}")
+            report(0.96, f"Wobble preview: {preview_path}")
         else:
-            report(0.98, "Preview video skipped (no test cameras or rendering failed)")
+            report(0.96, "Wobble preview skipped (no test cameras or rendering failed)")
+
+        report(0.97, "Phase 4b: Rendering temporal replay video")
+        replay_path = self.render_temporal_replay_video(
+            preview_dir, num_frames=120, fps=30, wobble_factor=0.05,
+        )
+        if replay_path:
+            result.temporal_replay_path = replay_path
+            report(0.99, f"Temporal replay: {replay_path}")
+        else:
+            report(0.99, "Temporal replay skipped")
 
         report(1.0, "Instant4D pipeline complete")
         return result
@@ -855,6 +870,62 @@ class Instant4DAdapter:
                 return None
         except Exception as e:
             logger.warning(f"Preview video rendering failed: {e}")
+            return None
+
+    def render_temporal_replay_video(
+        self,
+        output_dir: str,
+        num_frames: int = 120,
+        fps: int = 30,
+        wobble_factor: float = 0.05,
+    ) -> Optional[str]:
+        """Render temporal replay video showing the 4D scene evolving over time.
+
+        Unlike the diagnostic wobble video (which freezes time and moves the camera),
+        this advances the timestamp each frame while applying gentle camera motion,
+        producing a video that shows the full temporal evolution of the 4D model.
+
+        Args:
+            output_dir: Directory for video output.
+            num_frames: Total frames in output video.
+            fps: Video frame rate.
+            wobble_factor: Amplitude of camera wobble (0 = fixed viewpoint).
+
+        Returns:
+            Path to output MP4, or None if rendering failed.
+        """
+        if self._scene is None or self._gaussian_model is None or self._pipe_params is None:
+            logger.warning("Cannot render temporal replay: model/scene not loaded")
+            return None
+
+        import torch
+
+        scene = self._scene
+        gaussians = self._gaussian_model
+        pipe_params = self._pipe_params
+
+        bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            logger.info(
+                f"Rendering temporal replay: {num_frames} frames, "
+                f"wobble_factor={wobble_factor}"
+            )
+            video_path = scene.render_temporal_replay(
+                str(output_path), gaussians, pipe_params, bg_color,
+                num_frames=num_frames, fps=fps, wobble_factor=wobble_factor,
+            )
+
+            if video_path and os.path.exists(video_path):
+                logger.info(f"Temporal replay video saved: {video_path}")
+                return video_path
+            else:
+                logger.warning("render_temporal_replay completed but no video produced")
+                return None
+        except Exception as e:
+            logger.warning(f"Temporal replay rendering failed: {e}")
             return None
 
     def cleanup(self) -> None:
