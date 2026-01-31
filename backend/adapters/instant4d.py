@@ -201,15 +201,23 @@ class Instant4DAdapter:
         logger.info(f"Instant4D found at {self.INSTANT4D_PATH}")
 
     def _add_instant4d_to_path(self) -> None:
-        """Add Instant4D to Python path for imports."""
+        """Add Instant4D and submodule paths for imports."""
         if self._path_added:
             return
 
-        instant4d_str = str(self.INSTANT4D_PATH)
-        if instant4d_str not in sys.path:
-            sys.path.insert(0, instant4d_str)
-            self._path_added = True
-            logger.debug(f"Added {instant4d_str} to Python path")
+        paths = [
+            self.INSTANT4D_PATH,
+            self.INSTANT4D_PATH / "submodule" / "fussed-ssim",
+            self.INSTANT4D_PATH / "submodule",
+            self.INSTANT4D_PATH / "submodule" / "pointops2",
+            self.INSTANT4D_PATH / "submodule" / "simple-knn",
+        ]
+        for p in paths:
+            p_str = str(p)
+            if p_str not in sys.path:
+                sys.path.insert(0, p_str)
+        self._path_added = True
+        logger.debug(f"Added Instant4D paths to Python path")
 
     def _validate_cuda_kernels(self) -> None:
         """
@@ -221,7 +229,7 @@ class Instant4DAdapter:
         self._add_instant4d_to_path()
 
         try:
-            from diff_gaussian_rasterization import GaussianRasterizer
+            from gaussian_renderer import GaussianRasterizer
 
             assert GaussianRasterizer is not None
         except ImportError as e:
@@ -231,7 +239,7 @@ class Instant4DAdapter:
             ) from e
 
         try:
-            from simple_knn import distCUDA2
+            from simple_knn._C import distCUDA2
 
             assert distCUDA2 is not None
         except ImportError as e:
@@ -483,24 +491,24 @@ class Instant4DAdapter:
         report(0.15, f"Starting training ({total_iterations} iterations)")
 
         for iteration in range(1, total_iterations + 1):
-            # Sample training view
+            # Update learning rate (exponential decay for position params)
+            gaussians.update_learning_rate(iteration)
+
+            # Sample training view — CameraDataset.__getitem__ returns (image, camera)
             camera_idx = iteration % len(training_cameras)
-            viewpoint = training_cameras[camera_idx]
+            gt_image, viewpoint = training_cameras[camera_idx]
+
+            # Move to GPU
+            gt_image = gt_image.cuda()
+            viewpoint = viewpoint.cuda()
 
             # Render
             render_pkg = render(viewpoint, gaussians, pipe_params, bg_color)
             image = render_pkg["render"]
 
-            # Get ground truth
-            gt_image = viewpoint.original_image.cuda()
-
             # Compute loss
             loss = self._compute_loss(image, gt_image)
             loss.backward()
-
-            # Optimizer step
-            gaussians.optimizer.step()
-            gaussians.optimizer.zero_grad(set_to_none=True)
 
             # Track metrics
             with torch.no_grad():
@@ -513,14 +521,22 @@ class Instant4DAdapter:
                 pct = 0.15 + 0.75 * (iteration / total_iterations)
                 report(pct, f"Iteration {iteration}/{total_iterations}, PSNR: {psnr:.2f}")
 
-            # Densification and pruning
+            # Densification and pruning (must read gradients before zero_grad)
             if iteration < opt_params.densify_until_iter:
                 gaussians.max_radii2D[render_pkg["visibility_filter"]] = torch.max(
                     gaussians.max_radii2D[render_pkg["visibility_filter"]],
                     render_pkg["radii"][render_pkg["visibility_filter"]],
                 )
+
+                # Compute temporal gradient for 4D Gaussians
+                t_grad = None
+                if gaussians.gaussian_dim == 4:
+                    t_grad = gaussians._t.grad.clone().detach()
+
                 gaussians.add_densification_stats(
-                    render_pkg["viewspace_points"], render_pkg["visibility_filter"]
+                    render_pkg["viewspace_points"],
+                    render_pkg["visibility_filter"],
+                    t_grad,
                 )
 
                 if (
@@ -535,7 +551,12 @@ class Instant4DAdapter:
                         opt_params.thresh_opa_prune,
                         scene.cameras_extent,
                         size_threshold,
+                        opt_params.densify_grad_t_threshold,
                     )
+
+            # Optimizer step (after densification reads gradients)
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
 
         # Save checkpoint
         report(0.92, "Saving model checkpoint")
@@ -674,8 +695,8 @@ class Instant4DAdapter:
     def run_full_pipeline(
         self,
         video_result: "VideoProcessingResult",
-        segmentation_result: Optional["ObjectSegmentationResult"],
         output_dir: str,
+        segmentation_result: Optional["ObjectSegmentationResult"] = None,
         options: Optional[Instant4DOptions] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> Instant4DResult:
@@ -1334,41 +1355,39 @@ class Instant4DAdapter:
         dynamic_mask = prob_motion > options.motion_threshold
         static_mask = ~dynamic_mask
 
-        filtered_indices = []
+        results = []  # list of (xyz, rgb, prob, time, scale) tuples
 
         # Filter static points
         if np.any(static_mask):
             voxel_size = mean_depth / focal * options.static_voxel_scale
-            static_xyz = xyz[static_mask]
-            static_indices = np.where(static_mask)[0]
-
-            # Downsample
-            _, indices = pcu.downsample_point_cloud_voxel_grid(
-                voxel_size, static_xyz, return_indices=True
+            s_xyz, s_rgb, s_prob, s_time, s_scale = pcu.downsample_point_cloud_on_voxel_grid(
+                voxel_size,
+                xyz[static_mask],
+                rgb[static_mask],
+                prob_motion[static_mask],
+                time_stamp[static_mask],
+                scale_time[static_mask],
             )
-            filtered_indices.extend(static_indices[indices])
+            results.append((s_xyz, s_rgb, s_prob, s_time, s_scale))
 
         # Filter dynamic points
         if np.any(dynamic_mask):
             voxel_size = mean_depth / focal * options.dynamic_voxel_scale
-            dynamic_xyz = xyz[dynamic_mask]
-            dynamic_indices = np.where(dynamic_mask)[0]
-
-            # Downsample
-            _, indices = pcu.downsample_point_cloud_voxel_grid(
-                voxel_size, dynamic_xyz, return_indices=True
+            d_xyz, d_rgb, d_prob, d_time, d_scale = pcu.downsample_point_cloud_on_voxel_grid(
+                voxel_size,
+                xyz[dynamic_mask],
+                rgb[dynamic_mask],
+                prob_motion[dynamic_mask],
+                time_stamp[dynamic_mask],
+                scale_time[dynamic_mask],
             )
-            filtered_indices.extend(dynamic_indices[indices])
+            results.append((d_xyz, d_rgb, d_prob, d_time, d_scale))
 
-        # Apply filter
-        filtered_indices = np.array(filtered_indices)
-        return (
-            xyz[filtered_indices],
-            rgb[filtered_indices],
-            prob_motion[filtered_indices],
-            time_stamp[filtered_indices],
-            scale_time[filtered_indices],
-        )
+        if not results:
+            return xyz, rgb, prob_motion, time_stamp, scale_time
+
+        # Concatenate static + dynamic results
+        return tuple(np.concatenate([r[i] for r in results], axis=0) for i in range(5))
 
     def _create_instant4d_transforms(
         self,
@@ -1378,6 +1397,11 @@ class Instant4DAdapter:
         num_frames: int,
     ) -> None:
         """Create transforms_train.json and transforms_test.json for Instant4D."""
+        # Symlink Stage 1 frames into preprocessed directory so Instant4D can find them
+        frames_link = output_path / "frames"
+        if not frames_link.exists():
+            frames_link.symlink_to(Path(frames_dir).resolve())
+
         frames = transforms["frames"]
 
         # Split 90/10 train/test
@@ -1415,7 +1439,7 @@ class Instant4DAdapter:
         """Build Instant4D training configuration objects."""
         from argparse import Namespace
 
-        # Model parameters
+        # Model parameters (must match Instant4D's ModelParams defaults)
         model_params = Namespace(
             source_path=preprocessed_dir,
             model_path=str(output_path),
@@ -1432,10 +1456,11 @@ class Instant4DAdapter:
             dataloader=False,
         )
 
-        # Optimization parameters
+        # Optimization parameters (must match Instant4D's OptimizationParams defaults)
         opt_params = Namespace(
             iterations=options.iterations,
             position_lr_init=0.00016,
+            position_t_lr_init=-1.0,  # <0 means fallback to position_lr_init
             position_lr_final=0.0000016,
             position_lr_delay_mult=0.01,
             position_lr_max_steps=5000,
@@ -1446,11 +1471,18 @@ class Instant4DAdapter:
             densify_from_iter=500,
             densify_until_iter=min(15000, options.iterations),
             densify_grad_threshold=0.0002,
+            densify_grad_t_threshold=0.000005,
             densification_interval=100,
             opacity_reset_interval=3000,
+            densify_until_num_points=-1,
+            final_prune_from_iter=-1,
+            sh_increase_interval=1000,
             thresh_opa_prune=0.005,
             percent_dense=0.01,
             lambda_dssim=0.2,
+            lambda_opa_mask=0.0,
+            lambda_rigid=0.0,
+            lambda_motion=0.0,
         )
 
         # Pipeline parameters
@@ -1458,6 +1490,10 @@ class Instant4DAdapter:
             convert_SHs_python=False,
             compute_cov3D_python=False,
             debug=False,
+            env_map_res=0,
+            env_optimize_until=1000000000,
+            env_optimize_from=0,
+            eval_shfs_4d=False,
         )
 
         return model_params, opt_params, pipe_params

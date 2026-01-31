@@ -299,11 +299,16 @@ class MegaSamPoseEstimator:
                     image = cv2.imread(str(img_path))
                     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-                    # Run inference
-                    predictions = model.infer(image_rgb)
+                    # Run inference — UniDepthV2 expects a CHW float tensor
+                    rgb_torch = torch.from_numpy(image_rgb).permute(2, 0, 1).float().to(device)
+                    predictions = model.infer(rgb_torch)
 
                     depth = predictions["depth"].cpu().numpy().squeeze()
-                    fov = predictions.get("fov", torch.tensor([60.0])).cpu().numpy().item()
+                    # UniDepthV2 returns intrinsics, not fov — compute FOV from focal length
+                    intrinsics = predictions["intrinsics"]
+                    fx = intrinsics[0, 0, 0].cpu().item()
+                    w = predictions["depth"].shape[-1]
+                    fov = float(np.rad2deg(2 * np.arctan(w / (2 * fx))))
 
                     fovs.append(fov)
 
@@ -345,7 +350,7 @@ class MegaSamPoseEstimator:
             if str(da_path) not in sys.path:
                 sys.path.insert(0, str(da_path))
 
-            from depth_anything.dpt import DepthAnything
+            from depth_anything.dpt import DPT_DINOv2
             from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
             from torchvision.transforms import Compose
         except ImportError:
@@ -355,10 +360,18 @@ class MegaSamPoseEstimator:
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load model
-        model = DepthAnything.from_pretrained(
-            "LiheYoung/depth-anything-large-hf"
-        ).to(device).eval()
+        # Load model — vitl encoder with local checkpoint (not HuggingFace)
+        model = DPT_DINOv2(
+            encoder='vitl',
+            features=256,
+            out_channels=[256, 512, 1024, 1024],
+            localhub=False,  # Download DINOv2 backbone from GitHub (no local cache on Colab)
+        )
+        model.load_state_dict(
+            torch.load(str(self.DEPTH_ANYTHING_WEIGHTS), map_location='cpu'),
+            strict=True,
+        )
+        model = model.to(device).eval()
 
         # Setup transforms
         transform = Compose([
@@ -897,7 +910,7 @@ class VideoProcessingStage:
                 try:
                     self._run_hloc_pipeline(frames_dir, transforms_path, sparse_path)
                     report(0.9, "hloc pipeline completed (fallback)")
-                except RuntimeError as e2:
+                except (RuntimeError, ImportError) as e2:
                     # Further cascade to DUSt3R
                     logger.warning(f"hloc pipeline also failed: {e2}")
                     report(0.7, "Falling back to DUSt3R...")

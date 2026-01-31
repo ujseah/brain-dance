@@ -35,6 +35,7 @@ numpy>=1.24.0
 # --- Video Processing & Pose Estimation ---
 # Uncomment for Stage 1: Video Processing
 opencv-python>=4.8.0
+kornia>=0.6.0
 # ffmpeg-python>=0.2.0
 
 # --- Camera Pose Estimation ---
