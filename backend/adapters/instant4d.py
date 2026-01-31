@@ -593,6 +593,8 @@ class Instant4DAdapter:
         model_path: str,
         output_dir: str,
         timestamps: Optional[List[float]] = None,
+        export_fps: float = 30.0,
+        opacity_threshold: float = 0.01,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> List[str]:
         """
@@ -608,6 +610,8 @@ class Instant4DAdapter:
             model_path: Path to trained model checkpoint
             output_dir: Directory for PLY outputs
             timestamps: List of timestamps to export (default: derived from training)
+            export_fps: Frames per second for fallback frame count when timestamps not provided
+            opacity_threshold: Minimum effective opacity to include a Gaussian
             progress_callback: Progress updates (pct: float, msg: str)
 
         Returns:
@@ -636,8 +640,7 @@ class Instant4DAdapter:
         if timestamps is None:
             t_min, t_max = gaussians.time_duration
             duration = t_max - t_min
-            # Default: fps-based fallback (30 fps * duration)
-            num_frames = max(1, int(duration * 30))
+            num_frames = max(1, int(duration * export_fps))
             timestamps = np.linspace(t_min, t_max, num_frames).tolist()
 
         ply_paths = []
@@ -667,7 +670,7 @@ class Instant4DAdapter:
                 opacity = gaussians.get_opacity.cpu().numpy().squeeze()
                 marginal_np = marginal_t.cpu().numpy().squeeze()
                 effective_opacity = opacity * marginal_np
-                active_mask = effective_opacity > 0.01
+                active_mask = effective_opacity > opacity_threshold
 
                 # Extract all Gaussian properties for active points
                 xyz_active = xyz[active_mask]
@@ -765,6 +768,8 @@ class Instant4DAdapter:
             result.model_path,
             str(output_path / "plys"),
             timestamps=export_timestamps,
+            export_fps=options.export_fps,
+            opacity_threshold=options.opacity_threshold,
             progress_callback=lambda p, m: report(0.8 + p * 0.15, f"[Export] {m}"),
         )
 
