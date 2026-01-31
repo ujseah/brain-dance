@@ -38,7 +38,7 @@ class Instant4DOptions:
     """Options for Instant4D 4D Gaussian training."""
 
     # Training parameters
-    iterations: int = 5000
+    iterations: int = 5_000
     """Number of optimization iterations."""
 
     batch_size: int = 1
@@ -102,6 +102,9 @@ class Instant4DResult:
 
     config_path: Optional[str] = None
     """Path to training configuration used."""
+
+    preview_video_path: Optional[str] = None
+    """Path to rendered preview video (quality check)."""
 
     temporal_metadata: Dict[str, Any] = field(default_factory=dict)
     """Temporal metadata (fps, duration, timestamps)."""
@@ -611,8 +614,9 @@ class Instant4DAdapter:
         # Determine timestamps to export
         if timestamps is None:
             t_min, t_max = gaussians.time_duration
-            # Default: 30 frames
-            num_frames = 30
+            duration = t_max - t_min
+            # Default: fps-based fallback (30 fps * duration)
+            num_frames = max(1, int(duration * 30))
             timestamps = np.linspace(t_min, t_max, num_frames).tolist()
 
         ply_paths = []
@@ -644,17 +648,18 @@ class Instant4DAdapter:
                 effective_opacity = opacity * marginal_np
                 active_mask = effective_opacity > 0.01
 
+                # Extract all Gaussian properties for active points
                 xyz_active = xyz[active_mask]
+                features_dc = gaussians._features_dc.cpu().numpy()[active_mask, 0, :]  # [N, 3]
+                opacity_raw = gaussians._opacity.cpu().numpy()[active_mask]  # [N, 1] logit-space
+                scaling_raw = gaussians._scaling.cpu().numpy()[active_mask, :3]  # [N, 3] log-space (skip t)
+                rotation_raw = gaussians._rotation.cpu().numpy()[active_mask]  # [N, 4] quaternions
 
-                # Get colors from spherical harmonics (DC term)
-                shs = gaussians._features_dc.cpu().numpy()
-                # SH DC to RGB: color = SH * 0.28209479177 + 0.5
-                rgb = shs[active_mask, 0, :] * 0.28209479177 + 0.5
-                rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
-
-            # Write PLY
+            # Write standard 3DGS PLY format
             ply_path = output_path / f"frame_{i:04d}.ply"
-            self._write_ply(ply_path, xyz_active, rgb)
+            self._write_splat_ply(
+                ply_path, xyz_active, features_dc, opacity_raw, scaling_raw, rotation_raw
+            )
             ply_paths.append(str(ply_path))
 
             # Progress update
@@ -716,12 +721,30 @@ class Instant4DAdapter:
             lambda p, m: report(0.2 + p * 0.6, f"[Train] {m}"),
         )
 
-        # Phase 3: Export (80-100%)
+        # Phase 3: Export (80-95%)
         report(0.8, "Phase 3: Exporting per-frame PLYs")
+
+        # Derive frame count from transforms_train.json written during preprocessing
+        transforms_train_path = output_path / "preprocessed" / "transforms_train.json"
+        if transforms_train_path.exists():
+            with open(transforms_train_path) as f:
+                train_transforms = json.load(f)
+            num_train_frames = len(train_transforms.get("frames", []))
+        else:
+            num_train_frames = 0
+
+        # Build explicit timestamps matching training frame count
+        t_min, t_max = options.time_duration
+        if num_train_frames > 0:
+            export_timestamps = np.linspace(t_min, t_max, num_train_frames).tolist()
+        else:
+            export_timestamps = None  # fallback to fps-based default
+
         ply_paths = self.extract_per_frame_ply(
             result.model_path,
             str(output_path / "plys"),
-            progress_callback=lambda p, m: report(0.8 + p * 0.2, f"[Export] {m}"),
+            timestamps=export_timestamps,
+            progress_callback=lambda p, m: report(0.8 + p * 0.15, f"[Export] {m}"),
         )
 
         # Update result
@@ -738,8 +761,75 @@ class Instant4DAdapter:
             ),
         }
 
+        # Phase 4: Preview video (95-100%) — quality check
+        report(0.95, "Phase 4: Rendering preview video (quality check)")
+        preview_path = self.render_preview_video(str(output_path / "preview"))
+        if preview_path:
+            result.preview_video_path = preview_path
+            report(0.98, f"Preview video: {preview_path}")
+        else:
+            report(0.98, "Preview video skipped (no test cameras or rendering failed)")
+
         report(1.0, "Instant4D pipeline complete")
         return result
+
+    def render_preview_video(self, output_dir: str) -> Optional[str]:
+        """Render a preview video from trained model as a quality check.
+
+        Uses Instant4D's render_evaluate_sora() to render test camera views
+        with wobble animation. Requires eval=True so test cameras are available.
+
+        Args:
+            output_dir: Directory for video output
+
+        Returns:
+            Path to output MP4, or None if rendering failed
+        """
+        if self._scene is None or self._gaussian_model is None or self._pipe_params is None:
+            logger.warning("Cannot render preview: model/scene not loaded")
+            return None
+
+        import torch
+
+        scene = self._scene
+        gaussians = self._gaussian_model
+        pipe_params = self._pipe_params
+
+        # Check for test cameras (requires eval=True during training)
+        if not hasattr(scene, "test_cameras") or not scene.test_cameras:
+            logger.warning("No test cameras available (was eval=True set?)")
+            return None
+
+        # Check test_cameras dict has entries
+        test_cam_keys = list(scene.test_cameras.keys())
+        if not test_cam_keys or len(scene.test_cameras[test_cam_keys[0]]) == 0:
+            logger.warning("Test camera list is empty")
+            return None
+
+        bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            logger.info("Rendering preview video (quality check)")
+            scene.render_evaluate_sora(
+                str(output_path), gaussians, pipe_params, bg_color
+            )
+
+            # Find the generated video (render_evaluate_sora writes to test/ subdir)
+            test_dir = output_path / "test"
+            video_files = sorted(test_dir.glob("novel_view_*.mp4")) if test_dir.exists() else []
+
+            if video_files:
+                video_path = str(video_files[0])
+                logger.info(f"Preview video saved: {video_path}")
+                return video_path
+            else:
+                logger.warning("render_evaluate_sora completed but no video file found")
+                return None
+        except Exception as e:
+            logger.warning(f"Preview video rendering failed: {e}")
+            return None
 
     def cleanup(self) -> None:
         """Release GPU memory and resources."""
@@ -1334,7 +1424,12 @@ class Instant4DAdapter:
             resolution=1,
             white_background=False,
             data_device="cuda",
-            eval=False,
+            eval=True,
+            extension="",  # file_path in transforms JSON already includes extension
+            num_extra_pts=0,
+            loaded_pth="",
+            frame_ratio=1,
+            dataloader=False,
         )
 
         # Optimization parameters
@@ -1343,7 +1438,7 @@ class Instant4DAdapter:
             position_lr_init=0.00016,
             position_lr_final=0.0000016,
             position_lr_delay_mult=0.01,
-            position_lr_max_steps=30000,
+            position_lr_max_steps=5000,
             feature_lr=0.0025,
             opacity_lr=0.05,
             scaling_lr=0.005,
@@ -1469,8 +1564,65 @@ class Instant4DAdapter:
         with open(config_path, "w") as f:
             yaml.dump(config, f)
 
-    def _write_ply(self, path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
-        """Write point cloud to PLY file."""
+    def _write_splat_ply(
+        self,
+        path: Path,
+        xyz: np.ndarray,
+        features_dc: np.ndarray,
+        opacity: np.ndarray,
+        scaling: np.ndarray,
+        rotation: np.ndarray,
+    ) -> None:
+        """Write standard 3DGS PLY file compatible with splat viewers.
+
+        All values are pre-activation (raw parameters):
+        - opacity: logit-space (not sigmoid-activated)
+        - scaling: log-space (not exp-activated)
+        - rotation: unnormalized quaternions
+
+        With sh_degree=0, sh_degree_t=0: 17 properties per vertex
+        (3 pos + 3 normals + 3 f_dc + 1 opacity + 3 scale + 4 rotation).
+        """
+        try:
+            from plyfile import PlyData, PlyElement
+        except ImportError:
+            raise ImportError("plyfile required. Install with: pip install plyfile")
+
+        num_points = xyz.shape[0]
+
+        dtype = [
+            ("x", "f4"), ("y", "f4"), ("z", "f4"),
+            ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+            ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+            ("opacity", "f4"),
+            ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
+            ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
+        ]
+
+        elements = np.empty(num_points, dtype=dtype)
+        elements["x"] = xyz[:, 0]
+        elements["y"] = xyz[:, 1]
+        elements["z"] = xyz[:, 2]
+        elements["nx"] = 0.0
+        elements["ny"] = 0.0
+        elements["nz"] = 0.0
+        elements["f_dc_0"] = features_dc[:, 0]
+        elements["f_dc_1"] = features_dc[:, 1]
+        elements["f_dc_2"] = features_dc[:, 2]
+        elements["opacity"] = opacity.squeeze()
+        elements["scale_0"] = scaling[:, 0]
+        elements["scale_1"] = scaling[:, 1]
+        elements["scale_2"] = scaling[:, 2]
+        elements["rot_0"] = rotation[:, 0]
+        elements["rot_1"] = rotation[:, 1]
+        elements["rot_2"] = rotation[:, 2]
+        elements["rot_3"] = rotation[:, 3]
+
+        vertex = PlyElement.describe(elements, "vertex")
+        PlyData([vertex], byte_order="<").write(str(path))
+
+    def _write_point_cloud_ply(self, path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
+        """Write simple point cloud PLY file (for debug/preview use)."""
         try:
             from plyfile import PlyData, PlyElement
         except ImportError:

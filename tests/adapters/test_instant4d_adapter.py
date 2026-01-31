@@ -500,7 +500,7 @@ class TestPLYExport:
 
         try:
             adapter = Instant4DAdapter()
-            adapter._write_ply(ply_path, xyz, rgb)
+            adapter._write_point_cloud_ply(ply_path, xyz, rgb)
 
             # Verify file exists
             assert ply_path.exists()
