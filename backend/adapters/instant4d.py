@@ -1668,7 +1668,7 @@ class Instant4DAdapter:
             densify_grad_threshold=0.0002,
             densify_grad_t_threshold=0.000005,
             densification_interval=100,
-            opacity_reset_interval=int(options.iterations * 0.8),  # size pruning in final 20%
+            opacity_reset_interval=3000,  # match upstream: size pruning during early densification
             densify_until_num_points=-1,
             final_prune_from_iter=-1,
             sh_increase_interval=1000,
