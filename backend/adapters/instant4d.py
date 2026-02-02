@@ -80,6 +80,16 @@ class Instant4DOptions:
     opacity_threshold: float = 0.01
     """Minimum opacity for including Gaussians in export."""
 
+    # Video rendering
+    replay_num_frames: int = 120
+    """Number of frames in temporal replay video (120 = 4 seconds at 30fps)."""
+
+    replay_fps: int = 30
+    """Frame rate for temporal replay video."""
+
+    replay_wobble_factor: float = 0.05
+    """Camera wobble amplitude for temporal replay (0 = fixed viewpoint)."""
+
 
 @dataclass
 class Instant4DResult:
@@ -803,7 +813,10 @@ class Instant4DAdapter:
 
         report(0.97, "Phase 4b: Rendering temporal replay video")
         replay_path = self.render_temporal_replay_video(
-            preview_dir, num_frames=120, fps=30, wobble_factor=0.05,
+            preview_dir,
+            num_frames=options.replay_num_frames,
+            fps=options.replay_fps,
+            wobble_factor=options.replay_wobble_factor,
         )
         if replay_path:
             result.temporal_replay_path = replay_path

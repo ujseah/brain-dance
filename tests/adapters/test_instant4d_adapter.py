@@ -764,3 +764,31 @@ class TestTemporalReplay:
         result = Instant4DResult(model_path="/tmp/test")
         assert hasattr(result, "temporal_replay_path")
         assert result.temporal_replay_path is None
+
+    def test_temporal_replay_handles_render_exception(self, tmp_path):
+        """render_temporal_replay_video returns None when rendering raises."""
+        from unittest.mock import MagicMock
+        from backend.adapters.instant4d import Instant4DAdapter
+
+        try:
+            adapter = Instant4DAdapter()
+            # Set up mocks so the early-exit guards pass
+            adapter._scene = MagicMock()
+            adapter._gaussian_model = MagicMock()
+            adapter._pipe_params = MagicMock()
+            # Make the scene method raise
+            adapter._scene.render_temporal_replay.side_effect = RuntimeError("GPU OOM")
+
+            result = adapter.render_temporal_replay_video(str(tmp_path / "output"))
+            assert result is None
+        except ImportError as e:
+            pytest.skip(f"Instant4D not available: {e}")
+
+    def test_replay_options_defaults(self):
+        """Instant4DOptions has configurable replay parameters with correct defaults."""
+        from backend.adapters.instant4d import Instant4DOptions
+
+        opts = Instant4DOptions()
+        assert opts.replay_num_frames == 120
+        assert opts.replay_fps == 30
+        assert opts.replay_wobble_factor == 0.05
