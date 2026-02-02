@@ -525,7 +525,7 @@ class Instant4DAdapter:
             image = render_pkg["render"]
 
             # Compute loss
-            loss = self._compute_loss(image, gt_image)
+            loss = self._compute_loss(image, gt_image, alpha=render_pkg.get("alpha"))
             loss.backward()
 
             # Track metrics
@@ -1668,7 +1668,7 @@ class Instant4DAdapter:
             densify_grad_threshold=0.0002,
             densify_grad_t_threshold=0.000005,
             densification_interval=100,
-            opacity_reset_interval=30000,  # >iterations so size pruning never activates at 5K iters
+            opacity_reset_interval=int(options.iterations * 0.8),  # size pruning in final 20%
             densify_until_num_points=-1,
             final_prune_from_iter=-1,
             sh_increase_interval=1000,
@@ -1693,8 +1693,13 @@ class Instant4DAdapter:
 
         return model_params, opt_params, pipe_params
 
-    def _compute_loss(self, image: "torch.Tensor", gt_image: "torch.Tensor") -> "torch.Tensor":
-        """Compute training loss (L1 + SSIM)."""
+    def _compute_loss(
+        self,
+        image: "torch.Tensor",
+        gt_image: "torch.Tensor",
+        alpha: "Optional[torch.Tensor]" = None,
+    ) -> "torch.Tensor":
+        """Compute training loss (L1 + SSIM + opacity sparsity)."""
         import torch
         import torch.nn.functional as F
 
@@ -1712,7 +1717,15 @@ class Instant4DAdapter:
             # Fallback: just use L1
             ssim_loss = torch.tensor(0.0, device=image.device)
 
-        return 0.8 * l1_loss + 0.2 * ssim_loss
+        loss = 0.8 * l1_loss + 0.2 * ssim_loss
+
+        # Opacity sparsity: penalize unnecessary rendered opacity to suppress floaters.
+        # Floaters are screen-space Gaussians the optimizer places at the camera plane;
+        # this gently discourages high total alpha in the rendered image.
+        if alpha is not None:
+            loss = loss + 0.001 * alpha.mean()
+
+        return loss
 
     def _compute_psnr(self, image: "torch.Tensor", gt_image: "torch.Tensor") -> float:
         """Compute PSNR between rendered and ground truth images."""
