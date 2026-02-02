@@ -1658,7 +1658,7 @@ class Instant4DAdapter:
             position_t_lr_init=-1.0,  # <0 means fallback to position_lr_init
             position_lr_final=0.0000016,
             position_lr_delay_mult=0.01,
-            position_lr_max_steps=5000,
+            position_lr_max_steps=options.iterations,
             feature_lr=0.0025,
             opacity_lr=0.05,
             scaling_lr=0.005,
