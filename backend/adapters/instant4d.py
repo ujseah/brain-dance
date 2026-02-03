@@ -332,20 +332,22 @@ class Instant4DAdapter:
 
         # Check if Mega-SAM depth maps are available (preferred)
         depth_maps_dir = video_result.metadata.get("depth_maps_dir")
+        frame_timestamps = None
         if depth_maps_dir and Path(depth_maps_dir).exists():
             try:
-                xyz, rgb = self._load_points_from_megasam_depth(
-                    depth_maps_dir, video_result.frames_dir, cam_c2w, intrinsic
+                xyz, rgb, frame_timestamps = self._load_points_from_megasam_depth(
+                    depth_maps_dir, video_result.frames_dir, cam_c2w, intrinsic,
+                    time_duration=options.time_duration,
                 )
                 report(0.3, f"Loaded {xyz.shape[0]} points from Mega-SAM depth")
             except Exception as e:
                 logger.warning(f"Failed to load Mega-SAM depth: {e}, falling back to sparse")
-                xyz, rgb = self._load_or_generate_points(
+                xyz, rgb, frame_timestamps = self._load_or_generate_points(
                     video_result, cam_c2w, intrinsic, num_frames, options
                 )
                 report(0.3, f"Loaded/generated {xyz.shape[0]} points (fallback)")
         else:
-            xyz, rgb = self._load_or_generate_points(
+            xyz, rgb, frame_timestamps = self._load_or_generate_points(
                 video_result, cam_c2w, intrinsic, num_frames, options
             )
             report(0.3, f"Loaded/generated {xyz.shape[0]} points")
@@ -378,7 +380,9 @@ class Instant4DAdapter:
         # Step 6: Assign timestamps to points
         report(0.55, "Assigning temporal coordinates")
         time_stamp, scale_time = self._assign_timestamps(
-            xyz, prob_motion, num_frames, options
+            xyz, prob_motion, num_frames, options,
+            frame_timestamps=frame_timestamps,
+            total_depth_frames=num_frames,
         )
 
         # Step 7: Apply voxel grid pruning
@@ -484,6 +488,26 @@ class Instant4DAdapter:
         # Load scene
         report(0.1, "Loading scene data")
         scene = Scene(model_params, gaussians, time_duration=list(options.time_duration))
+
+        # Override cameras_extent using point cloud extent
+        # For monocular video, getNerfppNorm() returns a tiny baseline which
+        # weakens densification thresholds (percent_dense * extent). Use the
+        # actual point cloud spatial extent instead.
+        npz_path = Path(preprocessed_dir) / "filtered_cvd.npz"
+        if npz_path.exists():
+            pc_data = np.load(npz_path)
+            pc_xyz = pc_data["xyz"]
+            pc_extent = np.linalg.norm(
+                pc_xyz.max(axis=0) - pc_xyz.min(axis=0)
+            )
+            original_extent = scene.cameras_extent
+            new_extent = max(pc_extent * 0.5, original_extent)
+            if new_extent > original_extent:
+                scene.cameras_extent = new_extent
+                logger.info(
+                    f"cameras_extent override: {original_extent:.4f} -> "
+                    f"{new_extent:.4f} (pc_extent={pc_extent:.4f})"
+                )
 
         # Setup optimizer
         report(0.12, "Setting up optimizer")
@@ -1178,14 +1202,21 @@ class Instant4DAdapter:
         intrinsic: np.ndarray,
         num_frames: int,
         options: Instant4DOptions,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Load sparse points or generate initial points."""
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Load sparse points or generate initial points.
+
+        Returns:
+            xyz, rgb, timestamps (timestamps is None when frame correlation
+            is not available, e.g. sparse points or random generation).
+        """
         if video_result.sparse_points_path and Path(video_result.sparse_points_path).exists():
-            return self._load_sparse_points(video_result.sparse_points_path)
+            xyz, rgb = self._load_sparse_points(video_result.sparse_points_path)
+            return xyz, rgb, None
         else:
-            return self._generate_initial_points(
+            xyz, rgb = self._generate_initial_points(
                 cam_c2w, intrinsic, num_frames, options.num_pts
             )
+            return xyz, rgb, None
 
     def _load_points_from_megasam_depth(
         self,
@@ -1195,9 +1226,13 @@ class Instant4DAdapter:
         intrinsic: np.ndarray,
         subsample_rate: int = 3,
         max_points: int = 200_000,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        time_duration: Tuple[float, float] = (0.0, 3.0),
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Load point cloud from Mega-SAM depth maps via back-projection.
+
+        Each point receives a timestamp derived from its source frame index,
+        matching the upstream Instant4D formula: ``frame_idx / total * t_range``.
 
         Args:
             depth_maps_dir: Directory containing depth NPZ files
@@ -1206,10 +1241,12 @@ class Instant4DAdapter:
             intrinsic: (3, 3) camera intrinsic matrix
             subsample_rate: Subsample every N-th frame to reduce points
             max_points: Maximum points to return
+            time_duration: (t_min, t_max) temporal range for timestamp mapping
 
         Returns:
             xyz: (M, 3) point coordinates
             rgb: (M, 3) point colors [0-1]
+            timestamps: (M,) per-point timestamp derived from source frame
         """
         import cv2
         from glob import glob
@@ -1223,14 +1260,19 @@ class Instant4DAdapter:
         data = np.load(depth_files[0])
         depths = data["depths"]  # (N, H, W)
         images = data.get("images")  # (N, H, W, 3) or None
+        total_depth_frames = depths.shape[0]
 
         all_xyz = []
         all_rgb = []
+        all_timestamps = []
 
-        # Subsample frames
-        frame_indices = list(range(0, depths.shape[0], subsample_rate))
+        t_min, t_max = time_duration
 
-        for idx in frame_indices:
+        # Subsample frames (matching upstream prune.py ::3 pattern)
+        frame_indices = list(range(0, total_depth_frames, subsample_rate))
+        num_subsampled = len(frame_indices)
+
+        for sub_idx, idx in enumerate(frame_indices):
             depth = depths[idx]
             H, W = depth.shape
 
@@ -1268,6 +1310,16 @@ class Instant4DAdapter:
                 xyz_world = (c2w[:3, :3] @ xyz_cam.T + c2w[:3, 3:4]).T
                 all_xyz.append(xyz_world)
 
+                # Frame-correlated timestamp (upstream prune.py:110)
+                # Uses subsampled index / subsampled count to map [0, t_range]
+                if num_subsampled > 1:
+                    t = sub_idx / num_subsampled * (t_max - t_min) + t_min
+                else:
+                    t = (t_min + t_max) / 2
+                all_timestamps.append(
+                    np.full(xyz_world.shape[0], t, dtype=np.float32)
+                )
+
                 # Get colors if available
                 if images is not None:
                     img = images[idx]
@@ -1280,15 +1332,17 @@ class Instant4DAdapter:
 
         xyz = np.concatenate(all_xyz, axis=0).astype(np.float32)
         rgb = np.concatenate(all_rgb, axis=0).astype(np.float32)
+        timestamps = np.concatenate(all_timestamps, axis=0).astype(np.float32)
 
         # Final subsampling if too many points
         if xyz.shape[0] > max_points:
             indices = np.random.choice(xyz.shape[0], max_points, replace=False)
             xyz = xyz[indices]
             rgb = rgb[indices]
+            timestamps = timestamps[indices]
 
         logger.info(f"Loaded {xyz.shape[0]} points from Mega-SAM depth")
-        return xyz, rgb
+        return xyz, rgb, timestamps
 
     def _load_megasam_motion_prob(
         self,
@@ -1470,32 +1524,62 @@ class Instant4DAdapter:
         prob_motion: np.ndarray,
         num_frames: int,
         options: Instant4DOptions,
+        frame_timestamps: Optional[np.ndarray] = None,
+        total_depth_frames: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Assign temporal coordinates to points.
+        Assign temporal coordinates and scales to points.
 
-        Static points get fixed timestamp at midpoint.
-        Dynamic points get timestamps spread across time range.
+        When frame_timestamps are provided (from depth loading), dynamic points
+        keep their frame-correlated timestamps and get tight temporal scales
+        matching upstream prune.py. Static points get midpoint timestamp with
+        full-range scale.
+
+        When frame_timestamps is None, falls back to random assignment for
+        backward compatibility.
+
+        Upstream reference (instant4d/script/prune.py):
+          - Static timestamp: midpoint (line 250)
+          - Static scale_t: full t_range (line 251)
+          - Dynamic scale_t: t_range / ((B-1) * 10) where B = original
+            frame count before subsampling (line 252)
         """
         t_min, t_max = options.time_duration
         t_mid = (t_min + t_max) / 2
         t_range = t_max - t_min
 
         num_points = xyz.shape[0]
+        # Static defaults: midpoint timestamp, full temporal range
         time_stamp = np.full(num_points, t_mid, dtype=np.float32)
-        scale_time = np.full(num_points, t_range / 2, dtype=np.float32)
+        scale_time = np.full(num_points, t_range, dtype=np.float32)
 
-        # Dynamic points: spread across time
         dynamic_mask = prob_motion > options.motion_threshold
         num_dynamic = np.sum(dynamic_mask)
 
         if num_dynamic > 0:
-            # Assign timestamps uniformly
-            time_stamp[dynamic_mask] = np.random.uniform(
-                t_min, t_max, num_dynamic
-            ).astype(np.float32)
-            # Smaller temporal scale for dynamic
-            scale_time[dynamic_mask] = t_range / 4
+            if frame_timestamps is not None:
+                # Use frame-correlated timestamps from depth loading
+                time_stamp[dynamic_mask] = frame_timestamps[dynamic_mask]
+            else:
+                # Fallback: random timestamps (legacy behavior)
+                time_stamp[dynamic_mask] = np.random.uniform(
+                    t_min, t_max, num_dynamic
+                ).astype(np.float32)
+
+            # Tight temporal scale for dynamic points
+            # Use original depth frame count (before subsampling) for scale
+            B = total_depth_frames if total_depth_frames is not None else num_frames
+            if B > 1:
+                scale_time[dynamic_mask] = t_range / ((B - 1) * 10)
+            else:
+                scale_time[dynamic_mask] = t_range
+
+        logger.info(
+            f"Timestamps assigned: {num_dynamic} dynamic "
+            f"(scale_t={scale_time[dynamic_mask].mean():.6f} if any), "
+            f"{num_points - num_dynamic} static "
+            f"(scale_t={t_range}, t_mid={t_mid})"
+        )
 
         return time_stamp, scale_time
 
