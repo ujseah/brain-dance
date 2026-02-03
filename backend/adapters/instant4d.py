@@ -90,6 +90,10 @@ class Instant4DOptions:
     replay_wobble_factor: float = 0.05
     """Camera wobble amplitude for temporal replay (0 = fixed viewpoint)."""
 
+    # Depth supervision
+    lambda_depth: float = 0.5
+    """Weight for depth supervision loss. 0 = disabled."""
+
 
 @dataclass
 class Instant4DResult:
@@ -410,6 +414,16 @@ class Instant4DAdapter:
             cam_c2w=cam_c2w.astype(np.float32),
         )
 
+        # Step 8b: Save GT depth maps for depth supervision during training
+        if depth_maps_dir and Path(depth_maps_dir).exists():
+            from glob import glob as _glob
+            _depth_files = sorted(_glob(f"{depth_maps_dir}/*_droid.npz"))
+            if _depth_files:
+                _gt_depths = np.load(_depth_files[0])["depths"]  # (N, H, W)
+                np.save(output_path / "gt_depths.npy", _gt_depths.astype(np.float32))
+                print(f"Saved GT depth maps ({_gt_depths.shape[0]} frames, "
+                      f"{_gt_depths.shape[1]}x{_gt_depths.shape[2]})")
+
         # Step 9: Create transforms_train.json and transforms_test.json
         report(0.9, "Creating Instant4D transforms")
         self._create_instant4d_transforms(
@@ -525,7 +539,20 @@ class Instant4DAdapter:
 
         # Training loop
         import torch
+        import torch.nn.functional as F
         from gaussian_renderer import render
+
+        # Load GT depth maps for depth supervision
+        gt_depth_path = Path(preprocessed_dir) / "gt_depths.npy"
+        gt_depths_tensor = None
+        if options.lambda_depth > 0 and gt_depth_path.exists():
+            gt_depths_np = np.load(str(gt_depth_path))  # (N, H, W)
+            gt_depths_tensor = torch.from_numpy(gt_depths_np).cuda()
+            print(f"Loaded GT depths: {gt_depths_tensor.shape}, "
+                  f"range [{gt_depths_tensor.min():.3f}, {gt_depths_tensor.max():.3f}]")
+        elif options.lambda_depth > 0:
+            print(f"WARNING: lambda_depth={options.lambda_depth} but gt_depths.npy "
+                  f"not found. Depth supervision disabled.")
 
         bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         training_cameras = scene.getTrainCameras()
@@ -558,8 +585,19 @@ class Instant4DAdapter:
             render_pkg = render(viewpoint, gaussians, pipe_params, bg_color)
             image = render_pkg["render"]
 
-            # Compute loss
+            # Compute photometric loss
             loss = self._compute_loss(image, gt_image, alpha=render_pkg.get("alpha"))
+
+            # Add depth supervision loss
+            depth_loss = None
+            if gt_depths_tensor is not None:
+                depth_loss = self._compute_depth_loss(
+                    render_pkg["depth"], gt_depths_tensor,
+                    viewpoint.uid, render_pkg.get("alpha"),
+                )
+                if depth_loss is not None:
+                    loss = loss + options.lambda_depth * depth_loss
+
             loss.backward()
 
             # Track metrics
@@ -571,7 +609,11 @@ class Instant4DAdapter:
             # Progress update every 100 iterations
             if iteration % 100 == 0 or iteration == 1:
                 pct = 0.15 + 0.75 * (iteration / total_iterations)
-                report(pct, f"Iteration {iteration}/{total_iterations}, PSNR: {psnr:.2f}")
+                depth_msg = ""
+                if gt_depths_tensor is not None and depth_loss is not None:
+                    depth_msg = f", depth_loss: {depth_loss.item():.4f}"
+                report(pct, f"Iteration {iteration}/{total_iterations}, "
+                       f"PSNR: {psnr:.2f}{depth_msg}")
 
             # Densification and pruning (must read gradients before zero_grad)
             if iteration < opt_params.densify_until_iter:
@@ -625,6 +667,30 @@ class Instant4DAdapter:
             f"min={scale_t_vals.min():.6f}, max={scale_t_vals.max():.6f}, "
             f"total_gaussians={gaussians.get_xyz.shape[0]}"
         )
+
+        # Diagnostic: depth supervision summary
+        if gt_depths_tensor is not None:
+            with torch.no_grad():
+                sample_indices = list(range(
+                    0, len(training_cameras),
+                    max(1, len(training_cameras) // 5),
+                ))
+                depth_errors = []
+                for si in sample_indices:
+                    _, vp = training_cameras[si]
+                    vp = vp.cuda()
+                    rpkg = render(vp, gaussians, pipe_params, bg_color)
+                    dl = self._compute_depth_loss(
+                        rpkg["depth"], gt_depths_tensor, vp.uid,
+                        rpkg.get("alpha"),
+                    )
+                    if dl is not None:
+                        depth_errors.append(dl.item())
+                if depth_errors:
+                    print(f"Final depth loss (log-L1): mean={np.mean(depth_errors):.4f}, "
+                          f"min={np.min(depth_errors):.4f}, max={np.max(depth_errors):.4f}")
+            del gt_depths_tensor
+            torch.cuda.empty_cache()
 
         # Save checkpoint
         report(0.92, "Saving model checkpoint")
@@ -1828,6 +1894,58 @@ class Instant4DAdapter:
             loss = loss + 0.001 * alpha.mean()
 
         return loss
+
+    def _compute_depth_loss(
+        self,
+        rendered_depth: "torch.Tensor",
+        gt_depths: "torch.Tensor",
+        camera_uid: int,
+        alpha: "Optional[torch.Tensor]" = None,
+    ) -> "Optional[torch.Tensor]":
+        """Compute depth supervision loss (log-space L1 with validity masking).
+
+        Log-space makes the loss scale-invariant so near-field geometry
+        (faces at ~1m) contributes equally to far-field background (~5-10m).
+
+        Args:
+            rendered_depth: Rasterizer output, shape (1, H, W), alpha-blended
+                camera-space z-depth.
+            gt_depths: Full GT depth tensor, shape (N, H, W), metric camera z.
+            camera_uid: Camera uid indexing into gt_depths[uid].
+            alpha: Rendered alpha, shape (1, H, W). Used to mask empty regions.
+
+        Returns:
+            Scalar depth loss tensor, or None if frame out of range or too few
+            valid pixels.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        if camera_uid >= gt_depths.shape[0]:
+            return None
+
+        gt_depth = gt_depths[camera_uid]  # (H_gt, W_gt)
+        rd = rendered_depth.squeeze(0)     # (1, H, W) -> (H, W)
+        H, W = rd.shape
+
+        # Resize GT depth to match rendered resolution if needed
+        H_gt, W_gt = gt_depth.shape
+        if H_gt != H or W_gt != W:
+            gt_depth = F.interpolate(
+                gt_depth[None, None], size=(H, W), mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+
+        # Validity mask: positive depths on both sides, sufficient alpha
+        valid = (gt_depth > 0.01) & (gt_depth < 100.0) & (rd > 0.01)
+        if alpha is not None:
+            valid = valid & (alpha.squeeze(0) > 0.05)
+
+        if valid.sum() < 100:
+            return None
+
+        # Log-space L1 (scale-invariant)
+        return F.l1_loss(torch.log(rd[valid]), torch.log(gt_depth[valid]))
 
     def _compute_psnr(self, image: "torch.Tensor", gt_image: "torch.Tensor") -> float:
         """Compute PSNR between rendered and ground truth images."""
