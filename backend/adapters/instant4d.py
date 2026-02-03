@@ -504,14 +504,24 @@ class Instant4DAdapter:
             new_extent = max(pc_extent * 0.5, original_extent)
             if new_extent > original_extent:
                 scene.cameras_extent = new_extent
-                logger.info(
-                    f"cameras_extent override: {original_extent:.4f} -> "
-                    f"{new_extent:.4f} (pc_extent={pc_extent:.4f})"
-                )
+            print(
+                f"cameras_extent: {scene.cameras_extent:.4f} "
+                f"(original={original_extent:.4f}, pc_extent={pc_extent:.4f})"
+            )
 
         # Setup optimizer
         report(0.12, "Setting up optimizer")
         gaussians.training_setup(opt_params)
+
+        # Reduce scaling_t learning rate to prevent temporal over-smoothing.
+        # With tight initial scale_t (~0.002 for dynamic points), the default
+        # lr=0.005 causes the optimizer to widen temporal scales to full range
+        # within 5K iters, destroying temporal localization and causing feature
+        # desync in the replay video.
+        for param_group in gaussians.optimizer.param_groups:
+            if param_group["name"] == "scaling_t":
+                param_group["lr"] *= 0.02  # 0.005 -> 0.0001
+                break
 
         # Training loop
         import torch
@@ -607,6 +617,14 @@ class Instant4DAdapter:
             # Optimizer step (after densification reads gradients)
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
+
+        # Diagnostic: verify temporal scales didn't collapse
+        scale_t_vals = gaussians.get_scaling_t.detach().cpu()
+        print(
+            f"Final scale_t stats: mean={scale_t_vals.mean():.6f}, "
+            f"min={scale_t_vals.min():.6f}, max={scale_t_vals.max():.6f}, "
+            f"total_gaussians={gaussians.get_xyz.shape[0]}"
+        )
 
         # Save checkpoint
         report(0.92, "Saving model checkpoint")
