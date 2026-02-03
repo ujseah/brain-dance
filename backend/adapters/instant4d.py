@@ -91,7 +91,7 @@ class Instant4DOptions:
     """Camera wobble amplitude for temporal replay (0 = fixed viewpoint)."""
 
     # Depth supervision
-    lambda_depth: float = 0.5
+    lambda_depth: float = 0.1
     """Weight for depth supervision loss. 0 = disabled."""
 
 
