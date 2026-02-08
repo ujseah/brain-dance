@@ -4,3 +4,6 @@
 [submodule "instant4d"]
 	path = instant4d
 	url = https://github.com/Zhanpeng1202/Instant4D.git
+[submodule "deformable3dgs"]
+	path = deformable3dgs
+	url = https://github.com/ingra14m/Deformable-3D-Gaussians
