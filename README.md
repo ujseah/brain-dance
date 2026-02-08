@@ -1,32 +1,30 @@
 # Brain Dance
 
-Transform video footage into explorable 3D worlds.
+Transform video footage into explorable **4D worlds**.
 
 ## Overview
 
-Brain Dance reconstructs 3D scenes from video input, creating Gaussian Splat representations you can explore in your browser. Point your camera at a space, walk through it, and Brain Dance builds a 3D world you can navigate freely — with AI filling in the parts you never saw.
+Brain Dance reconstructs dynamic 4D scenes from monocular video input, creating Gaussian Splat representations you can explore in your browser. Point your camera at a space, walk through it, and Brain Dance builds a 4D world you can navigate freely in space **while time progresses**.
 
 ## Features
 
-- **Video to 3D** — Convert video footage into explorable 3D Gaussian Splats
-- **AI hole-filling** — Automatically fill unseen regions with plausible geometry
-- **Web viewer** — Explore reconstructed scenes in any browser
+- **Video to 4D** — Convert video footage into explorable 4D Gaussian Splats
+- **Temporal playback** — Navigate in 3D while time progresses
+- **Web viewer** — Explore reconstructed scenes in any browser with time controls
 - **Compressed export** — SPZ format for fast web streaming
 
 ## How It Works
 
-<img width="4022" height="3075" alt="shapes at 26-01-24 22 38 55" src="https://github.com/user-attachments/assets/8e42058d-7212-4903-9f11-f9f81f30d8c2" />
-
 ```text
-Video Input → Frame Extraction → Pose Estimation → Object Segmentation → 3DGS Training → AI Scene Completion → Web Export
-              (ffmpeg)           (hloc/GLOMAP)      (SAM-2)               (Splatfacto)     (MVDream)             (SPZ)
+Video Input → Frame Extraction → Pose Estimation → 4D Reconstruction → Web Export
+              (ffmpeg)           (hloc/GLOMAP)      (De3DGS)            (SPZ)
 ```
 
-1. **Video Processing**: Extract frames and estimate camera poses
-2. **Object Segmentation**: SAM-2 tracks objects across frames for scene understanding
-3. **3DGS Training**: Train 3D Gaussian Splatting model from multi-view images
-4. **Scene Completion**: AI fills gaps where the camera never looked (using object masks)
-5. **Web Export**: Compress and bundle for browser viewing
+1. **Video Processing**: Extract frames and estimate camera poses (hloc/GLOMAP)
+2. **4D Reconstruction**: Train Deformable 3D Gaussians with temporal deformation MLP
+3. **Web Export**: Extract per-frame PLYs, compress to SPZ, bundle with temporal viewer
+
+> **Note**: Object Segmentation (SAM-2) and Scene Completion (MVDream) are available but currently skipped/deferred for the core 4D pipeline.
 
 ## Quick Start
 
@@ -52,16 +50,18 @@ brain-dance/
 ├── backend/
 │   ├── adapters/           # Model adapters
 │   │   ├── video_to_3dgs.py   # Main pipeline adapter
-│   │   └── versecrafter.py    # Legacy (MoGe-V2 depth)
+│   │   ├── deformable3dgs.py  # De3DGS adapter (in progress)
+│   │   └── instant4d.py       # Legacy (being replaced)
 │   ├── stages/             # Pipeline stages
-│   │   ├── video_processing.py
-│   │   ├── object_segmentation.py
-│   │   ├── gaussian_training.py
-│   │   ├── scene_completion.py
-│   │   └── web_export.py
+│   │   ├── video_processing.py    # ✅ Complete
+│   │   ├── object_segmentation.py # ⏭ Skipped for De3DGS
+│   │   ├── gaussian_training.py   # 🔄 In progress
+│   │   ├── scene_completion.py    # ⏸ Deferred
+│   │   └── web_export.py          # ⏳ Pending
 │   └── server.py           # FastAPI server
 ├── frontend/               # Next.js viewer (WIP)
-├── versecrafter/           # Submodule for MoGe-V2
+├── deformable3dgs/         # De3DGS submodule (4D reconstruction)
+├── instant4d/              # Instant4D submodule (legacy)
 └── docs/                   # Documentation
 ```
 
@@ -75,10 +75,10 @@ brain-dance/
 
 ## Acknowledgments
 
-- [Nerfstudio](https://nerf.studio/) for Splatfacto implementation
-- [VerseCrafter](https://github.com/TencentARC/VerseCrafter) for MoGe-V2 depth estimation
+- [Deformable 3D Gaussians](https://github.com/ingra14m/Deformable-3D-Gaussians) (CVPR 2024) for 4D reconstruction
 - [Spark.js](https://sparkjs.dev/) for web-based 3DGS rendering
 - [hloc](https://github.com/cvg/Hierarchical-Localization) for pose estimation
+- [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) for the foundational representation
 
 ## License
 
