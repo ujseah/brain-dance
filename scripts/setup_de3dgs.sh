@@ -29,7 +29,7 @@ echo ""
 # =============================================================================
 # Step 1: Check prerequisites
 # =============================================================================
-echo "[1/5] Checking prerequisites..."
+echo "[1/6] Checking prerequisites..."
 
 # Check nvcc (CUDA compiler)
 if ! command -v nvcc &> /dev/null; then
@@ -70,7 +70,7 @@ fi
 # Step 2: Verify submodule
 # =============================================================================
 echo ""
-echo "[2/5] Verifying De3DGS submodule..."
+echo "[2/6] Verifying De3DGS submodule..."
 
 if [ ! -d "$DE3DGS" ]; then
     echo "ERROR: deformable3dgs/ directory not found at $DE3DGS"
@@ -99,7 +99,7 @@ echo "  Nested submodules: OK"
 # Step 3: Install depth-diff-gaussian-rasterization
 # =============================================================================
 echo ""
-echo "[3/5] Installing depth-diff-gaussian-rasterization..."
+echo "[3/6] Installing depth-diff-gaussian-rasterization..."
 
 DIFF_GAUSS="$DE3DGS/submodules/depth-diff-gaussian-rasterization"
 if [ ! -d "$DIFF_GAUSS" ]; then
@@ -115,7 +115,7 @@ echo "  Installed: depth-diff-gaussian-rasterization"
 # Step 4: Install simple-knn
 # =============================================================================
 echo ""
-echo "[4/5] Installing simple-knn..."
+echo "[4/6] Installing simple-knn..."
 
 SIMPLE_KNN="$DE3DGS/submodules/simple-knn"
 if [ ! -d "$SIMPLE_KNN" ]; then
@@ -131,7 +131,7 @@ echo "  Installed: simple-knn"
 # Step 5: Install De3DGS Python dependencies
 # =============================================================================
 echo ""
-echo "[5/5] Installing De3DGS Python dependencies..."
+echo "[5/6] Installing De3DGS Python dependencies..."
 
 cd "$DE3DGS"
 # Install requirements (excluding the submodule paths which are handled above)
@@ -149,9 +149,8 @@ fi
 # Step 6: Verification
 # =============================================================================
 echo ""
-echo "========================================"
-echo "Verification"
-echo "========================================"
+echo "[6/6] Verifying installation..."
+echo ""
 
 # Return to project root
 cd "$PROJECT_ROOT"
@@ -192,9 +191,10 @@ if [ $ERRORS -eq 0 ]; then
     echo "All De3DGS dependencies installed successfully!"
     echo ""
     echo "Next steps:"
-    echo "  1. Download test dataset (bouncingballs):"
+    echo "  1. Download test dataset (D-NeRF bouncingballs):"
     echo "     mkdir -p deformable3dgs/data/dnerf"
-    echo "     # Download from: https://drive.google.com/drive/folders/1wKE5nDNB6XJD_MG"
+    echo "     # Download from: https://www.dropbox.com/s/0bf6fl0ye2vz3vr/data.zip?dl=0"
+    echo "     # Extract bouncingballs/ to deformable3dgs/data/dnerf/"
     echo ""
     echo "  2. Test training:"
     echo "     cd deformable3dgs"
