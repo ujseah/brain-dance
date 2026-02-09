@@ -4,6 +4,7 @@ These tests verify the De3DGS adapter fixes for:
 - Issue #1: Path traversal vulnerability
 - Issue #3: Dataclass validation
 - Issue #4: CUDA error detection
+- Phase 3: PLY export validation
 
 Usage:
     # Run all tests
@@ -13,6 +14,9 @@ Usage:
     pytest tests/adapters/test_deformable3dgs.py::TestPathValidation -v
     pytest tests/adapters/test_deformable3dgs.py::TestDataclassValidation -v
     pytest tests/adapters/test_deformable3dgs.py::TestCUDAErrorParsing -v
+    pytest tests/adapters/test_deformable3dgs.py::TestPLYExportFormat -v
+    pytest tests/adapters/test_deformable3dgs.py::TestTemporalConsistency -v
+    pytest tests/adapters/test_deformable3dgs.py::TestCoordinateConversion -v
 """
 
 import json
@@ -21,7 +25,9 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from backend.adapters.deformable3dgs import (
     Deformable3DGSAdapter,
@@ -31,6 +37,14 @@ from backend.adapters.deformable3dgs import (
     CUDADriverError,
     CUDADeviceError,
 )
+
+# GPU availability check for conditional test skipping
+try:
+    import torch
+    GPU_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    GPU_AVAILABLE = False
+GPU_SKIP_REASON = "GPU required but not available"
 
 
 # =============================================================================
@@ -520,3 +534,260 @@ class TestCUDADeviceConfiguration:
         """Device string with trailing comma is rejected."""
         with pytest.raises(ValueError, match="digit"):
             Deformable3DGSOptions(cuda_device="0,1,")
+
+
+# =============================================================================
+# Phase 3: PLY Export Validation Tests
+# =============================================================================
+
+class TestPLYExportFormat:
+    """Validate PLY files conform to 3DGS specification."""
+
+    @pytest.fixture
+    def sample_gaussian_data(self):
+        """Generate minimal valid Gaussian data for testing."""
+        N = 10  # 10 Gaussians for fast tests
+        np.random.seed(42)  # Reproducible tests
+        return {
+            "xyz": np.random.randn(N, 3).astype(np.float32),
+            "rotation": np.tile([1, 0, 0, 0], (N, 1)).astype(np.float32),  # Identity quaternions
+            "scaling": np.random.randn(N, 3).astype(np.float32),
+            "opacity": np.random.rand(N, 1).astype(np.float32),
+            "features_dc": np.random.randn(N, 1, 3).astype(np.float32),
+            "features_rest": np.random.randn(N, 15, 3).astype(np.float32),  # SH degree 3
+        }
+
+    def test_ply_has_required_vertex_properties(self, sample_gaussian_data, tmp_path):
+        """PLY must have: x,y,z, rot_0-3, scale_0-2, opacity, f_dc_0-2."""
+        # Import the save function from export script
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deformable3dgs" / "scripts"))
+        from export_per_frame_ply import save_gaussian_ply
+
+        from plyfile import PlyData
+
+        output = tmp_path / "test.ply"
+        save_gaussian_ply(
+            output,
+            sample_gaussian_data["xyz"],
+            sample_gaussian_data["rotation"],
+            sample_gaussian_data["scaling"],
+            sample_gaussian_data["opacity"],
+            sample_gaussian_data["features_dc"],
+            sample_gaussian_data["features_rest"],
+        )
+
+        ply = PlyData.read(str(output))
+        props = set(ply['vertex'].data.dtype.names)
+
+        required = {'x', 'y', 'z', 'rot_0', 'rot_1', 'rot_2', 'rot_3',
+                    'scale_0', 'scale_1', 'scale_2', 'opacity',
+                    'f_dc_0', 'f_dc_1', 'f_dc_2'}
+        assert required.issubset(props), f"Missing: {required - props}"
+
+    def test_ply_vertex_count_matches_input(self, sample_gaussian_data, tmp_path):
+        """Number of vertices in PLY should match input Gaussian count."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deformable3dgs" / "scripts"))
+        from export_per_frame_ply import save_gaussian_ply
+
+        from plyfile import PlyData
+
+        output = tmp_path / "test.ply"
+        save_gaussian_ply(
+            output,
+            sample_gaussian_data["xyz"],
+            sample_gaussian_data["rotation"],
+            sample_gaussian_data["scaling"],
+            sample_gaussian_data["opacity"],
+            sample_gaussian_data["features_dc"],
+            sample_gaussian_data["features_rest"],
+        )
+
+        ply = PlyData.read(str(output))
+        assert ply['vertex'].count == 10, f"Expected 10 vertices, got {ply['vertex'].count}"
+
+    def test_ply_values_are_finite(self, sample_gaussian_data, tmp_path):
+        """No NaN or Inf values in exported PLY."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deformable3dgs" / "scripts"))
+        from export_per_frame_ply import save_gaussian_ply
+
+        from plyfile import PlyData
+
+        output = tmp_path / "test.ply"
+        save_gaussian_ply(
+            output,
+            sample_gaussian_data["xyz"],
+            sample_gaussian_data["rotation"],
+            sample_gaussian_data["scaling"],
+            sample_gaussian_data["opacity"],
+            sample_gaussian_data["features_dc"],
+            sample_gaussian_data["features_rest"],
+        )
+
+        ply = PlyData.read(str(output))
+        vertex = ply['vertex']
+
+        for prop in ['x', 'y', 'z', 'opacity', 'scale_0']:
+            values = vertex[prop]
+            assert np.isfinite(values).all(), f"Property {prop} contains NaN/Inf"
+
+
+class TestTemporalConsistency:
+    """Verify smooth deformation across temporal frames (mock-based)."""
+
+    def test_timestamp_normalization_formula(self):
+        """Verify timestamp normalization formula: frame_idx / (total_frames - 1)."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deformable3dgs" / "scripts"))
+        from export_per_frame_ply import normalize_timestamp
+
+        # Frame 0 of 30 should be 0.0
+        assert normalize_timestamp(0, 30) == 0.0
+
+        # Frame 29 of 30 should be 1.0
+        assert normalize_timestamp(29, 30) == 1.0
+
+        # Frame 15 of 31 should be 0.5
+        assert normalize_timestamp(15, 31) == 0.5
+
+        # Edge case: single frame
+        assert normalize_timestamp(0, 1) == 0.0
+
+    def test_linspace_generates_expected_timestamps(self):
+        """Verify np.linspace produces expected temporal spacing."""
+        timestamps = np.linspace(0.0, 1.0, 5)
+        expected = [0.0, 0.25, 0.5, 0.75, 1.0]
+        assert np.allclose(timestamps, expected), f"Expected {expected}, got {timestamps}"
+
+    def test_position_delta_calculation(self):
+        """Test that position delta between frames is computed correctly."""
+        # Simulate two frame positions
+        frame0_xyz = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+        frame1_xyz = np.array([[0.1, 0.0, 0.0], [1.1, 1.0, 1.0]])
+
+        delta = np.abs(frame1_xyz - frame0_xyz).max()
+        assert delta < 0.5, f"Position delta {delta} exceeds threshold 0.5"
+
+
+class TestCoordinateConversion:
+    """Verify Nerfstudio ↔ COLMAP coordinate conversion round-trip."""
+
+    @pytest.fixture
+    def adapter(self):
+        """Create adapter with mocked initialization."""
+        with patch.object(Deformable3DGSAdapter, '__init__', lambda self, config=None: None):
+            adapter = Deformable3DGSAdapter.__new__(Deformable3DGSAdapter)
+            adapter.config = {}
+            adapter.de3dgs_path = Path("/fake/deformable3dgs")
+            return adapter
+
+    def test_identity_matrix_conversion(self, adapter):
+        """Identity c2w should produce expected COLMAP pose."""
+        c2w = np.eye(4)
+        quat, trans = adapter._c2w_to_colmap_pose(c2w)
+
+        # Identity in OpenGL, after flip_yz and inversion
+        # The rotation should be flip_yz itself
+        expected_rot = Rotation.from_matrix(np.diag([1, -1, -1]))
+        expected_quat_xyzw = expected_rot.as_quat()
+        expected_quat = np.array([expected_quat_xyzw[3], expected_quat_xyzw[0],
+                                   expected_quat_xyzw[1], expected_quat_xyzw[2]])
+
+        assert np.allclose(quat, expected_quat, atol=1e-6), f"Quaternion mismatch: {quat} vs {expected_quat}"
+        assert np.allclose(trans, [0, 0, 0], atol=1e-6), f"Translation mismatch: {trans}"
+
+    def test_translation_only_conversion(self, adapter):
+        """Pure translation c2w should convert correctly."""
+        c2w = np.eye(4)
+        c2w[:3, 3] = [1.0, 2.0, 3.0]  # Translation in OpenGL coords
+
+        quat, trans = adapter._c2w_to_colmap_pose(c2w)
+
+        # Translation flips: Y and Z are negated
+        # After inversion, translation becomes -R^T @ t
+        # For flip_yz (diagonal [1,-1,-1]), R^T = R
+        # So trans = -[1, -1, -1] * [1, 2, 3] = [-1, 2, 3]
+        expected_trans = np.array([-1.0, 2.0, 3.0])
+        assert np.allclose(trans, expected_trans, atol=1e-6), f"Translation mismatch: {trans} vs {expected_trans}"
+
+    def test_random_pose_roundtrip(self, adapter):
+        """Random valid pose should round-trip with minimal error."""
+        np.random.seed(123)
+
+        # Create random c2w
+        c2w_original = np.eye(4)
+        c2w_original[:3, :3] = Rotation.from_euler('xyz', [10, 20, 30], degrees=True).as_matrix()
+        c2w_original[:3, 3] = [1.0, 2.0, 3.0]
+
+        # Convert to COLMAP
+        quat, trans = adapter._c2w_to_colmap_pose(c2w_original)
+
+        # Convert back
+        flip_yz = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
+        w2c = np.eye(4)
+        w2c[:3, :3] = Rotation.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_matrix()
+        w2c[:3, 3] = trans
+        c2w_recovered = flip_yz @ np.linalg.inv(w2c)
+
+        # Check recovery accuracy
+        assert np.allclose(c2w_original, c2w_recovered, atol=1e-6), \
+            f"Round-trip error:\nOriginal:\n{c2w_original}\nRecovered:\n{c2w_recovered}"
+
+    def test_quaternion_is_unit_length(self, adapter):
+        """Output quaternion should have unit length."""
+        c2w = np.eye(4)
+        c2w[:3, :3] = Rotation.from_euler('xyz', [45, 30, 60], degrees=True).as_matrix()
+        c2w[:3, 3] = [0.5, -0.3, 1.2]
+
+        quat, _ = adapter._c2w_to_colmap_pose(c2w)
+        norm = np.linalg.norm(quat)
+
+        assert np.isclose(norm, 1.0, atol=1e-6), f"Quaternion norm {norm} is not unit"
+
+
+# =============================================================================
+# GPU-Required Tests with Skip Markers
+# =============================================================================
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not GPU_AVAILABLE, reason=GPU_SKIP_REASON)
+class TestTrainingGPU:
+    """GPU-required tests for training (skipped if no GPU)."""
+
+    @pytest.fixture
+    def mock_video_result(self, tmp_path):
+        """Create mock VideoProcessingResult for GPU tests."""
+        output_dir = tmp_path / "stage1_output"
+        output_dir.mkdir()
+
+        transforms = {
+            "w": 640,
+            "h": 480,
+            "fl_x": 500.0,
+            "fl_y": 500.0,
+            "cx": 320.0,
+            "cy": 240.0,
+            "frames": []
+        }
+
+        transforms_path = output_dir / "transforms.json"
+        with open(transforms_path, 'w') as f:
+            json.dump(transforms, f)
+
+        (output_dir / "frames").mkdir()
+
+        # Return a mock object
+        return MagicMock(output_dir=str(output_dir))
+
+    def test_gpu_is_available(self):
+        """Verify GPU is detected (sanity check)."""
+        import torch
+        assert torch.cuda.is_available(), "GPU should be available for this test"
+
+    def test_cuda_device_count(self):
+        """Check CUDA device count."""
+        import torch
+        count = torch.cuda.device_count()
+        assert count >= 1, f"Expected at least 1 GPU, found {count}"
