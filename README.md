@@ -24,7 +24,7 @@ Video Input → Frame Extraction → Pose Estimation → 4D Reconstruction → W
 2. **4D Reconstruction**: Train Deformable 3D Gaussians with temporal deformation MLP
 3. **Web Export**: Extract per-frame PLYs, compress to SPZ, bundle with temporal viewer
 
-> **Note**: Object Segmentation (SAM-2) and Scene Completion (MVDream) are available but currently skipped/deferred for the core 4D pipeline.
+> **Note**: Object Segmentation (SAM-2) was removed - De3DGS handles dynamics implicitly. Scene Completion (MVDream) is deferred for the core 4D pipeline.
 
 ## Quick Start
 
@@ -50,12 +50,11 @@ brain-dance/
 ├── backend/
 │   ├── adapters/           # Model adapters
 │   │   ├── video_to_3dgs.py   # Main pipeline adapter
-│   │   ├── deformable3dgs.py  # De3DGS adapter (in progress)
-│   │   └── instant4d.py       # Legacy (being replaced)
+│   │   ├── deformable3dgs.py  # ✅ De3DGS adapter (complete)
+│   │   └── instant4d.py       # Legacy (rollback only)
 │   ├── stages/             # Pipeline stages
 │   │   ├── video_processing.py    # ✅ Complete
-│   │   ├── object_segmentation.py # ⏭ Skipped for De3DGS
-│   │   ├── gaussian_training.py   # 🔄 In progress
+│   │   ├── gaussian_training.py   # ✅ Complete (De3DGS)
 │   │   ├── scene_completion.py    # ⏸ Deferred
 │   │   └── web_export.py          # ⏳ Pending
 │   └── server.py           # FastAPI server
