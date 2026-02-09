@@ -1,22 +1,26 @@
-"""Stage 3: 4D Gaussian Splatting Training with Instant4D.
+"""Stage 3: 4D Gaussian Splatting Training with Deformable 3D Gaussians.
 
-This stage trains a 4D Gaussian Splatting model from processed video data,
-enabling temporal reconstruction where users can navigate in 3D while time
-progresses.
+This stage trains a Deformable 3D Gaussian Splatting model from processed video data,
+enabling temporal reconstruction where users can navigate in 3D while time progresses.
 
 Architecture Notes:
-    - Uses Instant4DAdapter internally (not exposed in ADAPTERS registry)
-    - Accepts optional ObjectSegmentationResult from Stage 2 for dynamic/static separation
+    - Uses Deformable3DGSAdapter internally via subprocess isolation
+    - No segmentation required (De3DGS handles dynamics implicitly via deformation MLP)
     - Outputs per-frame PLY files for Stage 5 (Web Export)
+    - Legacy Instant4D adapter available via GAUSSIAN_ADAPTER=instant4d env var
+
+Reference:
+    - De3DGS Paper: "Deformable 3D Gaussians for High-Fidelity Monocular Dynamic Scene Reconstruction" (CVPR 2024)
+    - Repository: https://github.com/ingra14m/Deformable-3D-Gaussians
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Any
 import logging
+import os
 
 from .video_processing import VideoProcessingResult
-from .object_segmentation import ObjectSegmentationResult
 
 logger = logging.getLogger(__name__)
 
@@ -53,29 +57,36 @@ class GaussianTrainingResult:
 
 class GaussianTrainingStage:
     """
-    Stage 3: Train 4D Gaussian Splatting model from processed video data.
+    Stage 3: Train Deformable 3D Gaussian Splatting model from processed video data.
 
-    This stage uses Instant4D to create a true 4D reconstruction that supports
-    temporal playback - users can navigate in 3D space while time progresses.
+    This stage uses Deformable 3D Gaussians (De3DGS) to create a true 4D reconstruction
+    that supports temporal playback - users can navigate in 3D space while time progresses.
+
+    De3DGS Architecture:
+    - Canonical 3D Gaussians in a reference frame
+    - Per-Gaussian deformation MLP: f(position, time) -> (delta_pos, delta_rot, delta_scale)
+    - Implicitly learns motion without explicit segmentation
 
     Pipeline:
-    1. Preprocess Stage 1/2 outputs to Instant4D format
-    2. Apply voxel-based grid pruning (92% Gaussian reduction)
-    3. Train 4D Gaussians (~2-5 minutes)
-    4. Export per-frame PLY files for web viewing
+    1. Preprocess Stage 1 outputs to COLMAP format
+    2. Train canonical Gaussians + deformation MLP (~10-30 minutes)
+    3. Export per-frame PLY files for web viewing
 
     Input:
         - VideoProcessingResult from Stage 1 (frames + poses)
-        - ObjectSegmentationResult from Stage 2 (optional, for dynamic/static separation)
+        - No segmentation required (unlike legacy Instant4D)
 
     Output:
-        - Per-frame PLY files in output_dir/plys/
-        - Trained 4D model checkpoint
-        - Quality metrics (PSNR, SSIM)
+        - Per-frame PLY files in output_dir/per_frame_plys/
+        - Trained canonical Gaussians + deformation MLP
+        - Quality metrics (PSNR)
 
     Requirements:
-        - CUDA 12.1+ with compiled Instant4D kernels
-        - ~24GB VRAM for training
+        - CUDA 11.6+ with compiled De3DGS kernels
+        - ~12-16GB VRAM for training
+
+    Rollback:
+        Set GAUSSIAN_ADAPTER=instant4d environment variable to use legacy adapter.
     """
 
     def __init__(self, config: Optional[dict] = None):
@@ -84,27 +95,42 @@ class GaussianTrainingStage:
 
         Args:
             config: Configuration dictionary with keys:
-                - iterations: Training iterations (default: 5000)
+                - adapter: Adapter type - "deformable3dgs" (default) or "instant4d" (legacy)
+                - iterations: Training iterations (default: 20000 for De3DGS, 5000 for Instant4D)
                 - device: CUDA device (default: "cuda:0")
-                - enable_pruning: Enable voxel pruning (default: True)
-                - motion_threshold: Static/dynamic threshold (default: 0.5)
+                - export_num_frames: Frames to export (default: 30)
+                - is_blender: Use D-NeRF time encoding (default: False)
+                - is_6dof: Use SE(3) rigid transformation (default: False)
         """
         self.config = config or {}
         self._adapter = None
+        self._adapter_type = self.config.get(
+            "adapter",
+            os.environ.get("GAUSSIAN_ADAPTER", "deformable3dgs")
+        )
 
     def _get_adapter(self):
-        """Lazy-load Instant4DAdapter."""
+        """Lazy-load adapter based on configuration."""
         if self._adapter is None:
-            from ..adapters.instant4d import Instant4DAdapter
-
-            self._adapter = Instant4DAdapter(self.config)
+            if self._adapter_type == "deformable3dgs":
+                from ..adapters.deformable3dgs import Deformable3DGSAdapter
+                self._adapter = Deformable3DGSAdapter(self.config)
+            elif self._adapter_type == "instant4d":
+                # Legacy fallback - keep for rollback capability
+                from ..adapters.instant4d import Instant4DAdapter
+                self._adapter = Instant4DAdapter(self.config)
+            else:
+                raise ValueError(
+                    f"Unknown adapter type: {self._adapter_type}. "
+                    f"Available: 'deformable3dgs', 'instant4d'"
+                )
         return self._adapter
 
     def train(
         self,
         processed: VideoProcessingResult,
         output_dir: str,
-        segmentation: Optional[ObjectSegmentationResult] = None,
+        segmentation: Any = None,  # Kept for API compatibility, ignored by De3DGS
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> GaussianTrainingResult:
         """
@@ -113,19 +139,17 @@ class GaussianTrainingStage:
         Args:
             processed: Result from video processing stage (Stage 1).
             output_dir: Directory to store outputs.
-            segmentation: Result from object segmentation stage (Stage 2), optional.
-                         If provided, enables dynamic/static region separation.
+            segmentation: DEPRECATED - Not used by De3DGS.
+                         Kept for API compatibility with legacy Instant4D.
             progress_callback: Optional callback(progress, message).
 
         Returns:
             GaussianTrainingResult with paths to trained model and PLY files.
 
         Raises:
-            ImportError: If Instant4D is not properly installed.
+            ImportError: If adapter is not properly installed.
             RuntimeError: If training fails.
         """
-        from ..adapters.instant4d import Instant4DOptions
-
         def report(pct: float, msg: str) -> None:
             if progress_callback:
                 progress_callback(pct, msg)
@@ -134,48 +158,79 @@ class GaussianTrainingStage:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        report(0.0, "Initializing 4D Gaussian training")
+        report(0.0, f"Initializing 4D Gaussian training with {self._adapter_type}")
 
-        # Build options from config
-        options = Instant4DOptions(
-            iterations=self.config.get("iterations", 5000),
-            enable_pruning=self.config.get("enable_pruning", True),
-            motion_threshold=self.config.get("motion_threshold", 0.5),
-            gaussian_dim=self.config.get("gaussian_dim", 4),
-            rot_4d=self.config.get("rot_4d", True),
-        )
-
-        # Get adapter and run pipeline
         adapter = self._get_adapter()
 
         try:
-            report(0.02, "Running Instant4D pipeline")
-            result = adapter.run_full_pipeline(
-                video_result=processed,
-                segmentation_result=segmentation,
-                output_dir=str(output_path),
-                options=options,
-                progress_callback=lambda p, m: report(0.02 + p * 0.96, m),
-            )
+            if self._adapter_type == "deformable3dgs":
+                # Use De3DGS adapter
+                from ..adapters.deformable3dgs import Deformable3DGSOptions
 
-            report(0.98, "Finalizing results")
+                options = Deformable3DGSOptions(
+                    iterations=self.config.get("iterations", 20000),
+                    export_num_frames=self.config.get("export_num_frames", 30),
+                    is_blender=self.config.get("is_blender", False),
+                    is_6dof=self.config.get("is_6dof", False),
+                )
 
-            # Build result
-            training_result = GaussianTrainingResult(
-                # Backward compatibility: ply_path is first PLY
-                ply_path=result.ply_paths[0] if result.ply_paths else "",
-                num_gaussians=result.num_gaussians,
-                metrics=result.metrics,
-                config_path=result.config_path,
-                # New 4D fields
-                ply_paths=result.ply_paths,
-                model_path=result.model_path,
-                num_frames=result.num_frames,
-                temporal_metadata=result.temporal_metadata,
-            )
+                report(0.02, "Running De3DGS pipeline")
+                result = adapter.run_full_pipeline(
+                    video_result=processed,
+                    output_dir=str(output_path),
+                    options=options,
+                    progress_callback=lambda p, m: report(0.02 + p * 0.96, m),
+                )
 
-            report(1.0, f"4D training complete: {result.num_frames} frames, "
-                       f"{result.num_gaussians} Gaussians")
+                report(0.98, "Finalizing results")
+
+                training_result = GaussianTrainingResult(
+                    ply_path=result.ply_paths[0] if result.ply_paths else "",
+                    num_gaussians=result.num_gaussians,
+                    metrics=result.metrics,
+                    config_path=None,
+                    ply_paths=result.ply_paths,
+                    model_path=result.model_path,
+                    num_frames=result.num_frames,
+                    temporal_metadata=result.temporal_metadata,
+                )
+
+            else:
+                # Legacy Instant4D path
+                from ..adapters.instant4d import Instant4DOptions
+
+                options = Instant4DOptions(
+                    iterations=self.config.get("iterations", 5000),
+                    enable_pruning=self.config.get("enable_pruning", True),
+                    motion_threshold=self.config.get("motion_threshold", 0.5),
+                    gaussian_dim=self.config.get("gaussian_dim", 4),
+                    rot_4d=self.config.get("rot_4d", True),
+                )
+
+                report(0.02, "Running Instant4D pipeline (legacy)")
+                result = adapter.run_full_pipeline(
+                    video_result=processed,
+                    segmentation_result=segmentation,
+                    output_dir=str(output_path),
+                    options=options,
+                    progress_callback=lambda p, m: report(0.02 + p * 0.96, m),
+                )
+
+                report(0.98, "Finalizing results")
+
+                training_result = GaussianTrainingResult(
+                    ply_path=result.ply_paths[0] if result.ply_paths else "",
+                    num_gaussians=result.num_gaussians,
+                    metrics=result.metrics,
+                    config_path=result.config_path,
+                    ply_paths=result.ply_paths,
+                    model_path=result.model_path,
+                    num_frames=result.num_frames,
+                    temporal_metadata=result.temporal_metadata,
+                )
+
+            report(1.0, f"4D training complete: {training_result.num_frames} frames, "
+                       f"{training_result.num_gaussians} Gaussians")
 
             return training_result
 
@@ -184,7 +239,6 @@ class GaussianTrainingStage:
             raise RuntimeError(f"4D Gaussian training failed: {e}") from e
 
         finally:
-            # Cleanup to release GPU memory
             adapter.cleanup()
 
     def cleanup(self) -> None:

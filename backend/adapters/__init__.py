@@ -13,7 +13,14 @@ from .video_to_3dgs import VideoTo3DGSAdapter
 # Legacy adapter (kept for MoGe-V2 depth estimation in hole-filling)
 from .versecrafter import VerseCrafterAdapter
 
-# Instant4D adapter for 4D Gaussian Splatting (used internally by GaussianTrainingStage)
+# Deformable 3D Gaussians adapter (default for 4D reconstruction)
+from .deformable3dgs import (
+    Deformable3DGSAdapter,
+    Deformable3DGSOptions,
+    Deformable3DGSResult,
+)
+
+# Instant4D adapter for 4D Gaussian Splatting (legacy, used internally by GaussianTrainingStage)
 from .instant4d import Instant4DAdapter, Instant4DOptions, Instant4DResult
 
 # Registry of available adapters
@@ -63,17 +70,25 @@ def list_adapters() -> list:
 
 
 __all__ = [
+    # Base classes
     "WorldModelAdapter",
     "PreprocessResult",
     "GenerateResult",
     "ModelCapabilities",
     "DetectedObject",
     "CameraInfo",
+    # Public adapters
     "VideoTo3DGSAdapter",
     "VerseCrafterAdapter",
+    # De3DGS (default for 4D)
+    "Deformable3DGSAdapter",
+    "Deformable3DGSOptions",
+    "Deformable3DGSResult",
+    # Instant4D (legacy)
     "Instant4DAdapter",
     "Instant4DOptions",
     "Instant4DResult",
+    # Registry functions
     "get_adapter",
     "list_adapters",
     "ADAPTERS",
