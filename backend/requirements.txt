@@ -68,6 +68,8 @@ kornia>=0.6.0
 # =============================================================================
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
+scipy>=1.10.0        # For coordinate conversion tests (Rotation)
+plyfile>=0.8.0       # For PLY format validation tests
 
 # =============================================================================
 # GPU Dependencies (server only)

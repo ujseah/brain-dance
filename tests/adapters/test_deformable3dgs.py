@@ -36,6 +36,8 @@ from backend.adapters.deformable3dgs import (
     CUDAOutOfMemoryError,
     CUDADriverError,
     CUDADeviceError,
+    c2w_to_colmap_pose,
+    normalize_timestamp,
 )
 
 # GPU availability check for conditional test skipping
@@ -639,9 +641,8 @@ class TestTemporalConsistency:
 
     def test_timestamp_normalization_formula(self):
         """Verify timestamp normalization formula: frame_idx / (total_frames - 1)."""
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "deformable3dgs" / "scripts"))
-        from export_per_frame_ply import normalize_timestamp
+        # Using normalize_timestamp imported from backend.adapters.deformable3dgs
+        # (identical implementation to export_per_frame_ply, avoids submodule dependency)
 
         # Frame 0 of 30 should be 0.0
         assert normalize_timestamp(0, 30) == 0.0
@@ -674,19 +675,10 @@ class TestTemporalConsistency:
 class TestCoordinateConversion:
     """Verify Nerfstudio ↔ COLMAP coordinate conversion round-trip."""
 
-    @pytest.fixture
-    def adapter(self):
-        """Create adapter with mocked initialization."""
-        with patch.object(Deformable3DGSAdapter, '__init__', lambda self, config=None: None):
-            adapter = Deformable3DGSAdapter.__new__(Deformable3DGSAdapter)
-            adapter.config = {}
-            adapter.de3dgs_path = Path("/fake/deformable3dgs")
-            return adapter
-
-    def test_identity_matrix_conversion(self, adapter):
+    def test_identity_matrix_conversion(self):
         """Identity c2w should produce expected COLMAP pose."""
         c2w = np.eye(4)
-        quat, trans = adapter._c2w_to_colmap_pose(c2w)
+        quat, trans = c2w_to_colmap_pose(c2w)
 
         # Identity in OpenGL, after flip_yz and inversion
         # The rotation should be flip_yz itself
@@ -698,12 +690,12 @@ class TestCoordinateConversion:
         assert np.allclose(quat, expected_quat, atol=1e-6), f"Quaternion mismatch: {quat} vs {expected_quat}"
         assert np.allclose(trans, [0, 0, 0], atol=1e-6), f"Translation mismatch: {trans}"
 
-    def test_translation_only_conversion(self, adapter):
+    def test_translation_only_conversion(self):
         """Pure translation c2w should convert correctly."""
         c2w = np.eye(4)
         c2w[:3, 3] = [1.0, 2.0, 3.0]  # Translation in OpenGL coords
 
-        quat, trans = adapter._c2w_to_colmap_pose(c2w)
+        quat, trans = c2w_to_colmap_pose(c2w)
 
         # Translation flips: Y and Z are negated
         # After inversion, translation becomes -R^T @ t
@@ -712,7 +704,7 @@ class TestCoordinateConversion:
         expected_trans = np.array([-1.0, 2.0, 3.0])
         assert np.allclose(trans, expected_trans, atol=1e-6), f"Translation mismatch: {trans} vs {expected_trans}"
 
-    def test_random_pose_roundtrip(self, adapter):
+    def test_random_pose_roundtrip(self):
         """Random valid pose should round-trip with minimal error."""
         np.random.seed(123)
 
@@ -722,7 +714,7 @@ class TestCoordinateConversion:
         c2w_original[:3, 3] = [1.0, 2.0, 3.0]
 
         # Convert to COLMAP
-        quat, trans = adapter._c2w_to_colmap_pose(c2w_original)
+        quat, trans = c2w_to_colmap_pose(c2w_original)
 
         # Convert back
         flip_yz = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
@@ -735,13 +727,13 @@ class TestCoordinateConversion:
         assert np.allclose(c2w_original, c2w_recovered, atol=1e-6), \
             f"Round-trip error:\nOriginal:\n{c2w_original}\nRecovered:\n{c2w_recovered}"
 
-    def test_quaternion_is_unit_length(self, adapter):
+    def test_quaternion_is_unit_length(self):
         """Output quaternion should have unit length."""
         c2w = np.eye(4)
         c2w[:3, :3] = Rotation.from_euler('xyz', [45, 30, 60], degrees=True).as_matrix()
         c2w[:3, 3] = [0.5, -0.3, 1.2]
 
-        quat, _ = adapter._c2w_to_colmap_pose(c2w)
+        quat, _ = c2w_to_colmap_pose(c2w)
         norm = np.linalg.norm(quat)
 
         assert np.isclose(norm, 1.0, atol=1e-6), f"Quaternion norm {norm} is not unit"
