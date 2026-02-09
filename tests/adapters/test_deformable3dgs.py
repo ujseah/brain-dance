@@ -404,3 +404,119 @@ class TestAdapterIntegration:
         assert opts.sh_degree == 3
         assert opts.timeout_seconds == 7200
         assert opts.warm_up < opts.iterations
+        assert opts.cuda_device == "0"
+
+
+# =============================================================================
+# Issue #1 (Round 2): Workspace Boundary Validation Tests
+# =============================================================================
+
+class TestWorkspaceBoundaryValidation:
+    """Test workspace boundary validation for symlink attacks."""
+
+    @pytest.fixture
+    def adapter_with_workspace(self, tmp_path):
+        """Create adapter with workspace_root configured."""
+        with patch.object(Deformable3DGSAdapter, '__init__', lambda self, config=None: None):
+            adapter = Deformable3DGSAdapter.__new__(Deformable3DGSAdapter)
+            adapter.config = {"workspace_root": str(tmp_path)}
+            adapter.de3dgs_path = Path("/fake/deformable3dgs")
+            adapter.workspace_root = tmp_path.resolve()
+            return adapter
+
+    def test_accepts_path_within_workspace(self, adapter_with_workspace, tmp_path):
+        """Valid path within workspace is accepted."""
+        valid_file = tmp_path / "subdir" / "transforms.json"
+        valid_file.parent.mkdir(parents=True, exist_ok=True)
+        valid_file.write_text('{}')
+        adapter_with_workspace._validate_paths(valid_file)  # Should not raise
+
+    def test_rejects_path_outside_workspace(self, adapter_with_workspace, tmp_path):
+        """Path outside workspace is rejected."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            f.write(b'{}')
+            outside_path = Path(f.name)
+
+        try:
+            with pytest.raises(ValueError, match="outside workspace boundary"):
+                adapter_with_workspace._validate_paths(outside_path)
+        finally:
+            outside_path.unlink()
+
+    def test_rejects_symlink_pointing_outside(self, adapter_with_workspace, tmp_path):
+        """Symlink pointing outside workspace is rejected."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            f.write(b'{}')
+            outside_target = Path(f.name)
+
+        # Create symlink inside workspace pointing outside
+        symlink_path = tmp_path / "sneaky_link.json"
+        symlink_path.symlink_to(outside_target)
+
+        try:
+            with pytest.raises(ValueError, match="outside workspace boundary"):
+                adapter_with_workspace._validate_paths(symlink_path)
+        finally:
+            symlink_path.unlink()
+            outside_target.unlink()
+
+    def test_no_workspace_check_when_not_configured(self, adapter, tmp_path):
+        """When workspace_root is None, no boundary check is performed."""
+        valid_file = tmp_path / "transforms.json"
+        valid_file.write_text('{}')
+        adapter._validate_paths(valid_file)  # Should not raise
+
+
+# =============================================================================
+# Issue #5: CUDA Device Configuration Tests
+# =============================================================================
+
+class TestCUDADeviceConfiguration:
+    """Test CUDA device configuration in Deformable3DGSOptions."""
+
+    def test_default_device_is_zero(self):
+        """Default CUDA device is '0'."""
+        opts = Deformable3DGSOptions()
+        assert opts.cuda_device == "0"
+
+    def test_accepts_single_device(self):
+        """Single device index is accepted."""
+        opts = Deformable3DGSOptions(cuda_device="1")
+        assert opts.cuda_device == "1"
+
+    def test_accepts_multiple_devices(self):
+        """Comma-separated device list is accepted."""
+        opts = Deformable3DGSOptions(cuda_device="0,1,2")
+        assert opts.cuda_device == "0,1,2"
+
+    def test_accepts_high_device_index(self):
+        """High device index is accepted (for multi-GPU systems)."""
+        opts = Deformable3DGSOptions(cuda_device="7")
+        assert opts.cuda_device == "7"
+
+    def test_rejects_empty_device(self):
+        """Empty device string is rejected."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            Deformable3DGSOptions(cuda_device="")
+
+    def test_rejects_invalid_format_letters(self):
+        """Invalid device format with letters is rejected."""
+        with pytest.raises(ValueError, match="digit"):
+            Deformable3DGSOptions(cuda_device="gpu0")
+
+    def test_rejects_negative_device(self):
+        """Negative device index is rejected."""
+        with pytest.raises(ValueError, match="digit"):
+            Deformable3DGSOptions(cuda_device="-1")
+
+    def test_rejects_spaces(self):
+        """Device string with spaces is rejected."""
+        with pytest.raises(ValueError, match="digit"):
+            Deformable3DGSOptions(cuda_device="0, 1")
+
+    def test_rejects_trailing_comma(self):
+        """Device string with trailing comma is rejected."""
+        with pytest.raises(ValueError, match="digit"):
+            Deformable3DGSOptions(cuda_device="0,1,")

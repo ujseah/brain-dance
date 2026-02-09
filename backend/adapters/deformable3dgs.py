@@ -117,6 +117,9 @@ class Deformable3DGSOptions:
     timeout_seconds: int = 7200
     """Maximum training time (2 hours default)."""
 
+    cuda_device: str = "0"
+    """CUDA device index or comma-separated list (e.g., "0", "0,1")."""
+
     def __post_init__(self):
         """Validate all configuration parameters."""
         # Training iterations
@@ -161,6 +164,16 @@ class Deformable3DGSOptions:
             raise ValueError(
                 f"timeout_seconds={self.timeout_seconds} is too short. "
                 "Minimum recommended is 60 seconds."
+            )
+
+        # CUDA device validation
+        if not self.cuda_device:
+            raise ValueError("cuda_device cannot be empty")
+        # Validate format: should be digits optionally separated by commas
+        if not re.match(r'^\d+(,\d+)*$', self.cuda_device):
+            raise ValueError(
+                f"cuda_device must be digit(s) optionally comma-separated, "
+                f"got '{self.cuda_device}'"
             )
 
         # Path validation (if provided)
@@ -424,7 +437,9 @@ class Deformable3DGSAdapter:
         Initialize adapter.
 
         Args:
-            config: Configuration dictionary (deprecated, use options instead)
+            config: Configuration dictionary with optional keys:
+                - de3dgs_path: Path to De3DGS submodule
+                - workspace_root: Root directory for path validation (security)
         """
         self.config = config or {}
 
@@ -435,20 +450,25 @@ class Deformable3DGSAdapter:
         if not self.de3dgs_path.exists():
             logger.warning(f"De3DGS path not found: {self.de3dgs_path}")
 
+        # Workspace root for path validation (optional but recommended)
+        # If set, all input paths must resolve within this directory
+        workspace_root = self.config.get("workspace_root")
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
+
     def _validate_paths(self, transforms_path: Path) -> None:
         """
         Validate input paths before processing.
 
-        Security: Prevents path traversal attacks by checking the original path
-        for ".." components BEFORE resolution, and verifying the resolved path
-        is within the expected workspace directory.
+        Security: Prevents path traversal attacks by:
+        1. Checking for ".." components in original path (before resolve)
+        2. Verifying resolved path is within workspace boundary (if configured)
 
         Args:
             transforms_path: Path to transforms.json
 
         Raises:
             FileNotFoundError: If transforms.json doesn't exist
-            ValueError: If path is invalid or contains path traversal
+            ValueError: If path is invalid, contains traversal, or outside workspace
         """
         # Check for path traversal in ORIGINAL path (before resolve)
         # Using .parts catches ".." as a path component, not just substring
@@ -458,7 +478,7 @@ class Deformable3DGSAdapter:
                 "Use absolute paths without '..' components."
             )
 
-        # Resolve to absolute path
+        # Resolve to absolute path (follows symlinks)
         resolved = transforms_path.resolve()
 
         # Verify path exists
@@ -468,6 +488,22 @@ class Deformable3DGSAdapter:
         # Verify correct file extension
         if resolved.suffix != '.json':
             raise ValueError(f"transforms_path must be a JSON file: {resolved}")
+
+        # Workspace boundary check (defense against symlink attacks)
+        if self.workspace_root is not None:
+            try:
+                # is_relative_to() returns True if resolved is under workspace_root
+                if not resolved.is_relative_to(self.workspace_root):
+                    raise ValueError(
+                        f"Path resolves outside workspace boundary: {resolved}. "
+                        f"Must be within: {self.workspace_root}"
+                    )
+            except ValueError:
+                # is_relative_to raises ValueError on Windows for different drives
+                raise ValueError(
+                    f"Path resolves outside workspace boundary: {resolved}. "
+                    f"Must be within: {self.workspace_root}"
+                )
 
     def _parse_cuda_error(
         self,
@@ -755,7 +791,7 @@ class Deformable3DGSAdapter:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": options.cuda_device},
             )
 
             last_iter = 0
@@ -824,15 +860,25 @@ class Deformable3DGSAdapter:
                 if iter_dirs:
                     deformation_pth = iter_dirs[0] / "deform.pth"
 
-        # Count Gaussians
+        # Count Gaussians with specific exception handling
         num_gaussians = 0
         if canonical_ply.exists():
             try:
                 from plyfile import PlyData
                 plydata = PlyData.read(str(canonical_ply))
                 num_gaussians = plydata['vertex'].count
+            except ImportError:
+                logger.warning(
+                    "plyfile not installed, cannot count Gaussians. "
+                    "Install with: pip install plyfile"
+                )
+            except OSError as e:
+                logger.warning(f"Could not read PLY file {canonical_ply}: {e}")
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Invalid PLY format in {canonical_ply}: {e}")
             except Exception as e:
-                logger.warning(f"Could not count Gaussians: {e}")
+                # Catch-all for truly unexpected errors
+                logger.error(f"Unexpected error counting Gaussians: {type(e).__name__}: {e}")
 
         report(1.0, f"Training complete: {num_gaussians} Gaussians")
 
@@ -918,7 +964,7 @@ class Deformable3DGSAdapter:
                 capture_output=True,
                 text=True,
                 timeout=1800,  # 30 minute timeout for export
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": options.cuda_device},
             )
 
             if result.returncode != 0:
