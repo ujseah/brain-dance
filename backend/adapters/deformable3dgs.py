@@ -45,6 +45,16 @@ class CUDAOutOfMemoryError(De3DGSError):
     pass
 
 
+class CUDADriverError(De3DGSError):
+    """Raised when CUDA driver issues are detected."""
+    pass
+
+
+class CUDADeviceError(De3DGSError):
+    """Raised when no CUDA device is available."""
+    pass
+
+
 class COLMAPConversionError(De3DGSError):
     """Raised when Nerfstudio → COLMAP format conversion fails."""
     pass
@@ -106,6 +116,63 @@ class Deformable3DGSOptions:
     # Runtime
     timeout_seconds: int = 7200
     """Maximum training time (2 hours default)."""
+
+    def __post_init__(self):
+        """Validate all configuration parameters."""
+        # Training iterations
+        if self.iterations <= 0:
+            raise ValueError(f"iterations must be positive, got {self.iterations}")
+        if self.iterations > 500000:
+            raise ValueError(
+                f"iterations={self.iterations} is unusually high. "
+                "Max recommended is 500000. Set explicitly if intentional."
+            )
+
+        # Spherical harmonics degree
+        if not 0 <= self.sh_degree <= 3:
+            raise ValueError(f"sh_degree must be 0-3, got {self.sh_degree}")
+
+        # Loss weight
+        if not 0.0 <= self.lambda_dssim <= 1.0:
+            raise ValueError(f"lambda_dssim must be in [0, 1], got {self.lambda_dssim}")
+
+        # Warm-up iterations
+        if self.warm_up < 0:
+            raise ValueError(f"warm_up must be non-negative, got {self.warm_up}")
+        if self.warm_up >= self.iterations:
+            raise ValueError(
+                f"warm_up ({self.warm_up}) must be less than iterations ({self.iterations})"
+            )
+
+        # Target points for downsampling
+        if self.target_points <= 0:
+            raise ValueError(f"target_points must be positive, got {self.target_points}")
+
+        # Export parameters
+        if self.export_num_frames <= 0:
+            raise ValueError(f"export_num_frames must be positive, got {self.export_num_frames}")
+        if self.export_fps <= 0:
+            raise ValueError(f"export_fps must be positive, got {self.export_fps}")
+
+        # Timeout
+        if self.timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {self.timeout_seconds}")
+        if self.timeout_seconds < 60:
+            raise ValueError(
+                f"timeout_seconds={self.timeout_seconds} is too short. "
+                "Minimum recommended is 60 seconds."
+            )
+
+        # Path validation (if provided)
+        if self.de3dgs_path is not None:
+            path = Path(self.de3dgs_path)
+            if not path.exists():
+                raise ValueError(f"de3dgs_path does not exist: {self.de3dgs_path}")
+            if not (path / "train.py").exists():
+                raise ValueError(
+                    f"de3dgs_path does not contain train.py: {self.de3dgs_path}. "
+                    "Ensure this is a valid De3DGS installation."
+                )
 
 
 @dataclass
@@ -372,23 +439,133 @@ class Deformable3DGSAdapter:
         """
         Validate input paths before processing.
 
+        Security: Prevents path traversal attacks by checking the original path
+        for ".." components BEFORE resolution, and verifying the resolved path
+        is within the expected workspace directory.
+
         Args:
             transforms_path: Path to transforms.json
 
         Raises:
             FileNotFoundError: If transforms.json doesn't exist
-            ValueError: If path is invalid
+            ValueError: If path is invalid or contains path traversal
         """
-        if not transforms_path.exists():
-            raise FileNotFoundError(f"transforms.json not found: {transforms_path}")
+        # Check for path traversal in ORIGINAL path (before resolve)
+        # Using .parts catches ".." as a path component, not just substring
+        if '..' in transforms_path.parts:
+            raise ValueError(
+                f"Path traversal not allowed: {transforms_path}. "
+                "Use absolute paths without '..' components."
+            )
 
-        if transforms_path.suffix != '.json':
-            raise ValueError(f"transforms_path must be a JSON file: {transforms_path}")
-
-        # Prevent path traversal attacks
+        # Resolve to absolute path
         resolved = transforms_path.resolve()
-        if '..' in str(resolved):
-            raise ValueError("Path traversal not allowed in transforms_path")
+
+        # Verify path exists
+        if not resolved.exists():
+            raise FileNotFoundError(f"transforms.json not found: {resolved}")
+
+        # Verify correct file extension
+        if resolved.suffix != '.json':
+            raise ValueError(f"transforms_path must be a JSON file: {resolved}")
+
+    def _parse_cuda_error(
+        self,
+        output: str,
+        return_code: int,
+        last_iteration: int
+    ) -> De3DGSError:
+        """
+        Parse subprocess output to identify specific CUDA errors.
+
+        Returns an appropriate exception with actionable error message.
+
+        Args:
+            output: Combined stdout/stderr from the subprocess
+            return_code: Process exit code
+            last_iteration: Last training iteration reached before failure
+
+        Returns:
+            Appropriate De3DGSError subclass with helpful message
+        """
+        output_lower = output.lower()
+
+        # CUDA Out of Memory
+        if "cuda out of memory" in output_lower or "out of memory" in output_lower:
+            # Try to extract memory info
+            mem_match = re.search(
+                r'Tried to allocate ([\d.]+) ([GMK]iB)',
+                output,
+                re.IGNORECASE
+            )
+            mem_info = f" (tried to allocate {mem_match.group(1)} {mem_match.group(2)})" if mem_match else ""
+
+            return CUDAOutOfMemoryError(
+                f"GPU out of memory at iteration {last_iteration}{mem_info}.\n\n"
+                "Recommended fixes:\n"
+                "  1. Reduce target_points (try 50000 instead of 100000)\n"
+                "  2. Reduce sh_degree from 3 to 2 or 1\n"
+                "  3. Use a GPU with more VRAM (minimum 12GB recommended)\n"
+                "  4. Process fewer frames (reduce input video length)"
+            )
+
+        # CUDA driver version mismatch
+        if "cuda driver version is insufficient" in output_lower:
+            return CUDADriverError(
+                "CUDA driver version is insufficient for this PyTorch version.\n\n"
+                "Recommended fixes:\n"
+                "  1. Update NVIDIA drivers: https://www.nvidia.com/drivers\n"
+                "  2. Check compatibility: PyTorch 2.3+ requires CUDA 12.1+\n"
+                "  3. Run 'nvidia-smi' to check current driver version"
+            )
+
+        # No CUDA device available
+        if "no cuda-capable device" in output_lower or "cuda is not available" in output_lower:
+            return CUDADeviceError(
+                "No CUDA-capable GPU detected.\n\n"
+                "Recommended fixes:\n"
+                "  1. Verify GPU is installed: run 'nvidia-smi'\n"
+                "  2. Check CUDA_VISIBLE_DEVICES environment variable\n"
+                "  3. Ensure NVIDIA drivers are installed correctly\n"
+                "  4. If on Mac, note that CUDA is not supported - use cloud GPU"
+            )
+
+        # Invalid device ordinal
+        if "invalid device ordinal" in output_lower:
+            return CUDADeviceError(
+                "Invalid CUDA device specified.\n\n"
+                "The requested GPU index does not exist.\n"
+                "Run 'nvidia-smi -L' to list available GPUs and their indices."
+            )
+
+        # CUDA initialization error
+        if "cuda error" in output_lower or "cudnn error" in output_lower:
+            return CUDADriverError(
+                f"CUDA/cuDNN error during training at iteration {last_iteration}.\n\n"
+                "This may indicate:\n"
+                "  1. Driver/toolkit version mismatch\n"
+                "  2. Corrupted CUDA installation\n"
+                "  3. Hardware issue with GPU\n\n"
+                f"Full error output:\n{output[-1000:]}"  # Last 1000 chars
+            )
+
+        # NaN/Inf detected (training divergence)
+        if "nan" in output_lower and ("loss" in output_lower or "gradient" in output_lower):
+            return De3DGSError(
+                f"Training diverged (NaN detected) at iteration {last_iteration}.\n\n"
+                "Recommended fixes:\n"
+                "  1. Reduce learning rate\n"
+                "  2. Increase warm_up iterations\n"
+                "  3. Check input data quality (poses may be incorrect)"
+            )
+
+        # Generic fallback with output snippet
+        output_snippet = output[-500:] if len(output) > 500 else output
+        return De3DGSError(
+            f"De3DGS training failed with exit code {return_code} "
+            f"at iteration {last_iteration}.\n\n"
+            f"Last output:\n{output_snippet}"
+        )
 
     def preprocess(
         self,
@@ -569,6 +746,7 @@ class Deformable3DGSAdapter:
         logger.info(f"Running: {' '.join(cmd)}")
 
         # Run training subprocess
+        output_lines = []  # Collect all output for error analysis
         try:
             process = subprocess.Popen(
                 cmd,
@@ -588,6 +766,9 @@ class Deformable3DGSAdapter:
                 line = line.strip()
                 if not line:
                     continue
+
+                # Store for error analysis
+                output_lines.append(line)
 
                 # Log all output for debugging
                 logger.debug(f"De3DGS: {line}")
@@ -611,12 +792,14 @@ class Deformable3DGSAdapter:
         except subprocess.TimeoutExpired:
             process.kill()
             raise TrainingTimeoutError(
-                f"Training timed out after {options.timeout_seconds} seconds"
+                f"Training timed out after {options.timeout_seconds} seconds "
+                f"(last iteration: {last_iter})"
             )
 
         if return_code != 0:
-            # Check for common errors
-            raise De3DGSError(f"De3DGS training failed with exit code {return_code}")
+            # Parse output for specific CUDA errors and provide actionable messages
+            all_output = "\n".join(output_lines)
+            raise self._parse_cuda_error(all_output, return_code, last_iter)
 
         report(0.98, "Training complete, locating outputs")
 
