@@ -1,0 +1,36 @@
+# Pinned dependencies for Colab reproducibility
+# Generated: 2026-02-09
+# Target environment: Google Colab (T4 GPU), Python 3.12, CUDA 12.1
+#
+# Usage in Colab:
+#   !pip install -r notebooks/requirements-colab.txt
+#
+# Note: PyTorch is pre-installed on Colab. Only install if version mismatch.
+
+# Core ML
+torch==2.5.1
+torchvision==0.20.1
+numpy==1.26.4
+scipy==1.13.1
+
+# 3D Gaussian Splatting
+plyfile==1.0.3
+
+# Image processing
+Pillow==10.3.0
+
+# Visualization
+matplotlib==3.9.0
+
+# Progress bars
+tqdm==4.66.4
+
+# Perceptual loss (De3DGS training)
+lpips==0.1.4
+
+# File downloads
+gdown==5.1.0
+
+# Optional: Testing
+# pytest==8.2.0
+# nbmake==1.5.0
