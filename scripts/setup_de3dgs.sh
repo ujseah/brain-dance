@@ -96,6 +96,37 @@ fi
 echo "  Nested submodules: OK"
 
 # =============================================================================
+# Step 2.5: Apply CUDA 12.x compatibility patches (if needed)
+# =============================================================================
+# Extract major version from CUDA_VERSION (e.g., "12.8" -> "12")
+CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d'.' -f1)
+
+if [ "$CUDA_MAJOR" -ge 12 ] 2>/dev/null; then
+    echo ""
+    echo "[2.5/6] Applying CUDA 12.x compatibility patches..."
+
+    PATCH_SCRIPT="$PROJECT_ROOT/scripts/patch_cuda12.sh"
+    if [ -f "$PATCH_SCRIPT" ]; then
+        bash "$PATCH_SCRIPT"
+    else
+        # Inline patching if script doesn't exist
+        echo "  Patch script not found, applying inline patches..."
+
+        SIMPLE_KNN="$DE3DGS/submodules/simple-knn/simple_knn.cu"
+        if [ -f "$SIMPLE_KNN" ] && ! grep -q "#include <float.h>" "$SIMPLE_KNN"; then
+            sed -i '1s/^/#include <float.h>\n/' "$SIMPLE_KNN"
+            echo "  [PATCHED] simple_knn.cu: added float.h"
+        fi
+
+        RASTER_IMPL="$DE3DGS/submodules/depth-diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.h"
+        if [ -f "$RASTER_IMPL" ] && ! grep -q "#include <cstdint>" "$RASTER_IMPL"; then
+            sed -i '1s/^/#include <cstdint>\n/' "$RASTER_IMPL"
+            echo "  [PATCHED] rasterizer_impl.h: added cstdint"
+        fi
+    fi
+fi
+
+# =============================================================================
 # Step 3: Install depth-diff-gaussian-rasterization
 # =============================================================================
 echo ""
