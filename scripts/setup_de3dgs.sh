@@ -114,13 +114,13 @@ if [ "$CUDA_MAJOR" -ge 12 ] 2>/dev/null; then
 
         SIMPLE_KNN="$DE3DGS/submodules/simple-knn/simple_knn.cu"
         if [ -f "$SIMPLE_KNN" ] && ! grep -q "#include <float.h>" "$SIMPLE_KNN"; then
-            sed -i '1s/^/#include <float.h>\n/' "$SIMPLE_KNN"
+            sed -i '1i #include <float.h>' "$SIMPLE_KNN"
             echo "  [PATCHED] simple_knn.cu: added float.h"
         fi
 
         RASTER_IMPL="$DE3DGS/submodules/depth-diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.h"
         if [ -f "$RASTER_IMPL" ] && ! grep -q "#include <cstdint>" "$RASTER_IMPL"; then
-            sed -i '1s/^/#include <cstdint>\n/' "$RASTER_IMPL"
+            sed -i '1i #include <cstdint>' "$RASTER_IMPL"
             echo "  [PATCHED] rasterizer_impl.h: added cstdint"
         fi
     fi
