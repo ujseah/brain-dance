@@ -1,15 +1,16 @@
 # Pinned dependencies for Colab reproducibility
-# Generated: 2026-02-09
-# Target environment: Google Colab (T4 GPU), Python 3.12, CUDA 12.1
+# Generated: 2026-02-10
+# Target environment: Google Colab (T4/L4 GPU), Python 3.12, CUDA 12.8
 #
 # Usage in Colab:
-#   !pip install -r notebooks/requirements-colab.txt
+#   !pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+#   !pip install -r notebooks/requirements-colab.txt --ignore-installed torch torchvision
 #
-# Note: PyTorch is pre-installed on Colab. Only install if version mismatch.
+# Note: Install PyTorch with cu128 index FIRST for CUDA 12.8 compatibility.
 
-# Core ML
-torch==2.5.1
-torchvision==0.20.1
+# Core ML (PyTorch installed separately with cu128 index)
+torch==2.8.0
+torchvision==0.23.0
 numpy==1.26.4
 scipy==1.13.1
 
