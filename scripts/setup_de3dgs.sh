@@ -108,7 +108,10 @@ if [ ! -d "$DIFF_GAUSS" ]; then
 fi
 
 cd "$DIFF_GAUSS"
-pip install -e . --quiet
+if ! pip install -e .; then
+    echo "  [FAIL] depth-diff-gaussian-rasterization compilation failed"
+    exit 1
+fi
 echo "  Installed: depth-diff-gaussian-rasterization"
 
 # =============================================================================
@@ -124,7 +127,10 @@ if [ ! -d "$SIMPLE_KNN" ]; then
 fi
 
 cd "$SIMPLE_KNN"
-pip install -e . --quiet
+if ! pip install -e .; then
+    echo "  [FAIL] simple-knn compilation failed"
+    exit 1
+fi
 echo "  Installed: simple-knn"
 
 # =============================================================================
@@ -135,7 +141,10 @@ echo "[5/6] Installing De3DGS Python dependencies..."
 
 cd "$DE3DGS"
 # Install requirements (excluding the submodule paths which are handled above)
-pip install --quiet plyfile==0.8.1 tqdm imageio==2.27.0 opencv-python imageio-ffmpeg scipy lpips
+if ! pip install plyfile==0.8.1 tqdm imageio==2.27.0 opencv-python imageio-ffmpeg scipy lpips; then
+    echo "  [FAIL] Python dependencies installation failed"
+    exit 1
+fi
 echo "  Installed: Python dependencies"
 
 # dearpygui is optional (for GUI training) - skip if it fails
