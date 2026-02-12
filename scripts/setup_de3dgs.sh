@@ -195,6 +195,11 @@ echo ""
 # Return to project root
 cd "$PROJECT_ROOT"
 
+# Set LD_LIBRARY_PATH to include PyTorch libs (needed for subprocess imports)
+# This fixes "libc10.so: cannot open shared object file" errors on Colab
+TORCH_LIB=$(python -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH}"
+
 # Verify each package
 ERRORS=0
 
