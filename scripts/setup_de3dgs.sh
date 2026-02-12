@@ -198,28 +198,28 @@ cd "$PROJECT_ROOT"
 # Verify each package
 ERRORS=0
 
-if python -c "from diff_gaussian_rasterization import GaussianRasterizationSettings" 2>/dev/null; then
+if python -c "from diff_gaussian_rasterization import GaussianRasterizationSettings"; then
     echo "  [OK] depth-diff-gaussian-rasterization"
 else
     echo "  [FAIL] depth-diff-gaussian-rasterization"
     ERRORS=$((ERRORS + 1))
 fi
 
-if python -c "from simple_knn._C import distCUDA2" 2>/dev/null; then
+if python -c "from simple_knn._C import distCUDA2"; then
     echo "  [OK] simple-knn"
 else
     echo "  [FAIL] simple-knn"
     ERRORS=$((ERRORS + 1))
 fi
 
-if python -c "import lpips" 2>/dev/null; then
+if python -c "import lpips"; then
     echo "  [OK] lpips"
 else
     echo "  [FAIL] lpips"
     ERRORS=$((ERRORS + 1))
 fi
 
-if python -c "from plyfile import PlyData" 2>/dev/null; then
+if python -c "from plyfile import PlyData"; then
     echo "  [OK] plyfile"
 else
     echo "  [FAIL] plyfile"
