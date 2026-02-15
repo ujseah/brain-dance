@@ -1,37 +1,38 @@
 # Pinned dependencies for Colab reproducibility
-# Generated: 2026-02-10
+# Generated: 2026-02-14
 # Target environment: Google Colab (T4/L4 GPU), Python 3.12, CUDA 12.8
 #
 # Usage in Colab:
 #   !pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 #   !pip install -r notebooks/requirements-colab.txt --ignore-installed torch torchvision
 #
-# Note: Install PyTorch with cu128 index FIRST for CUDA 12.8 compatibility.
+# Note: numpy/Pillow/matplotlib use Colab defaults (no downgrade needed).
+#       CUDA extensions compile at runtime against whatever numpy is installed.
 
 # Core ML (PyTorch installed separately with cu128 index)
 torch==2.8.0
 torchvision==0.23.0
-numpy==1.26.4
-scipy==1.13.1
+
+# Scientific computing (use Colab defaults for numpy)
+scipy>=1.12.0
 
 # 3D Gaussian Splatting
-plyfile==1.0.3
-
-# Image processing
-Pillow==10.3.0
-
-# Visualization
-matplotlib==3.9.0
+plyfile>=1.0
 
 # Progress bars
-tqdm==4.66.4
+tqdm>=4.66
 
 # Perceptual loss (De3DGS training)
-lpips==0.1.4
+lpips>=0.1.4
+
+# Image/video I/O
+imageio>=2.33
+opencv-python
+imageio-ffmpeg
 
 # File downloads
-gdown==5.1.0
+gdown>=5.1
 
 # Optional: Testing
-# pytest==8.2.0
-# nbmake==1.5.0
+# pytest>=8.0
+# nbmake>=1.5
